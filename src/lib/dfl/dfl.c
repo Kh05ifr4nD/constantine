@@ -1074,7 +1074,9 @@ DFL_FUNC void uint64_t_avx512_scatter_dfl_glob_store(unsigned char* obj, unsigne
         __mmask16 mask = _mm512_cmpeq_epi64_mask(target, current);
         current = _mm512_add_epi64(current, increment);
 
-        _mm512_mask_i64scatter_epi64((long long *)_ptr, mask, index, valuev, 1);
+        __m512i loaded = _mm512_i64gather_epi64(index, _ptr, 1);
+        __m512i writev = _mm512_mask_blend_epi64(mask, loaded, valuev);
+        _mm512_i64scatter_epi64((long long *)_ptr, index, writev, 1);
     }
 }
 
@@ -1109,7 +1111,9 @@ DFL_FUNC void uint32_t_avx512_scatter_dfl_glob_store(unsigned char* obj, unsigne
         __mmask16 mask = _mm512_cmpeq_epi32_mask(target, current);
         current = _mm512_add_epi32(current, increment);
 
-        _mm512_mask_i32scatter_epi32((long long *)_ptr, mask, index, valuev, 1);
+        __m512i loaded = _mm512_i32gather_epi32(index, _ptr, 1);
+        __m512i writev = _mm512_mask_blend_epi32(mask, loaded, valuev);
+        _mm512_i32scatter_epi32((long long *)_ptr, index, writev, 1);
     }
 }
 
