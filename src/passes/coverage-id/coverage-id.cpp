@@ -78,7 +78,7 @@ namespace {
         for (auto &F : M.getFunctionList()) {
             if (F.isDeclaration())
                 continue;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
             if (FuncGIDs)

@@ -4,6 +4,9 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 
+#include <algorithm>
+#include <map>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "hook"
@@ -264,8 +267,7 @@ namespace {
         static InlineFunctionInfo IFI;
         if (!Inline)
             return;
-        CallSite CS(CI);
-        InlineFunction(CS, IFI);
+        InlineFunction(*CI, IFI);
     }
 
     void preHook(Instruction *I, Function *F) {
@@ -344,17 +346,15 @@ namespace {
 
         // Determine hook name suffix. Also handle regular and intrinsic calls.
         Hooks *H;
-        CallSite CS(I);
         std::string suffix = I->getOpcodeName();
-        if (CS.getInstruction() && !CS.isInlineAsm()) {
-            Function *Callee = dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts());
-            if (Callee) {
-                if (CS.getIntrinsicID() == Intrinsic::ID::not_intrinsic)
+        if (auto *CB = dyn_cast<CallBase>(I); CB && !CB->isInlineAsm()) {
+            if (Function *Callee = CB->getCalledFunction()) {
+                auto id = CB->getIntrinsicID();
+                if (id == Intrinsic::ID::not_intrinsic)
                     suffix = "call_" + Callee->getName().str();
                 else // always starts with llvm_, e.g., llvm_memcpy
-                    suffix = IntrinsicFuncNameTable[CS.getIntrinsicID()];
-            }
-            else {
+                    suffix = IntrinsicFuncNameTable[id];
+            } else {
                 suffix = "icall";
             }
         }
@@ -409,10 +409,10 @@ namespace {
         passListRegexInit(FunctionRegexes, Functions);
 
         // Wrap main just in case we want to hook it
-        Function *F = M.getFunction("main");
-        assert(F);
-        F->setName("__main");
-        createWrapperFunction(F, "main");
+        if (Function *F = M.getFunction("main")) {
+            F->setName("__main");
+            createWrapperFunction(F, "main");
+        }
 
         // Try to hook all the instructions
         for (auto &F : M.getFunctionList()) {

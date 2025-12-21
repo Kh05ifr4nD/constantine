@@ -6,6 +6,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -13,6 +14,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include <memory>
 #include <set>
 using namespace llvm;
 
@@ -53,7 +55,7 @@ namespace {
     static std::unique_ptr<raw_fd_ostream> openFile(StringRef file) {
         std::error_code ec;
         auto ret =
-            llvm::make_unique<raw_fd_ostream>(file, ec, sys::fs::OpenFlags::F_None);
+            std::make_unique<raw_fd_ostream>(file, ec, sys::fs::OF_None);
         if (ec) {
             return nullptr;
         }
@@ -450,7 +452,8 @@ namespace {
         branchExtractPassLog("Extracting branches in " << F.getName());
         qprint("Extracting branches in " << F.getName().str());
         DominatorTree *DT = &getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
-        PostDominatorTree *PDT = &getAnalysis<PostDominatorTreeWrapperPass>(F).getPostDomTree();
+        PostDominatorTree PDT;
+        PDT.recalculate(F);
         LoopInfo *LI = &getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
 
         bool extracted;
@@ -466,7 +469,7 @@ namespace {
         BasicBlock* unidentified_branch = NULL;
         do {
             DT->recalculate(F);
-            PDT->recalculate(F);
+            PDT.recalculate(F);
             LI->releaseMemory();
             LI->analyze(*DT);
             extracted = 0;
@@ -478,8 +481,8 @@ namespace {
                 if (!BI)
                     continue;
                 if (!BI->isConditional()) continue;
-                IfCondition *IFC = getIfCondition(DT, PDT, BI);
-                Loop *Loop = getNaturalLoop(DT, PDT, LI, BI);
+                IfCondition *IFC = getIfCondition(DT, &PDT, BI);
+                Loop *Loop = getNaturalLoop(DT, &PDT, LI, BI);
                 if (!IFC && !Loop) {
                     // qprint("FAILED: " << BB.getName().str());
                     // BB.dump();
@@ -504,11 +507,11 @@ namespace {
 
             for (IfCondition &IFC : ifConditions) {
                 if(!ValidInfo) break;
-                bool needsCFL = AllBranches || branchNeedsCFL(IFC.Branch->getParent(), ifConditions, loops, *DT, *PDT);
+                bool needsCFL = AllBranches || branchNeedsCFL(IFC.Branch->getParent(), ifConditions, loops, *DT, PDT);
                 if (needsCFL)
-                    extracted = doExtract(F, IFC, *DT, *PDT, LI, ("__cfl_branch_"+F.getName().str()).c_str());
+                    extracted = doExtract(F, IFC, *DT, PDT, LI, ("__cfl_branch_"+F.getName().str()).c_str());
                 else
-                    extracted = doExtract(F, IFC, *DT, *PDT, LI, ("branch_"+F.getName().str()).c_str());
+                    extracted = doExtract(F, IFC, *DT, PDT, LI, ("branch_"+F.getName().str()).c_str());
                 // Do one at a time, since we modify BBs in doExtract
                 // qprint("extraction of ifc " << IFC.Branch->getParent()->getName().str() << (extracted? " success":" failed"));
                 if (extracted) {
@@ -528,11 +531,11 @@ namespace {
             if (!extracted) {
                 for (Loop *Loop : loops) {
                     if(!ValidInfo) break;
-                    bool needsCFL = AllBranches || branchNeedsCFL(Loop->getExitingBlock(), ifConditions, loops, *DT, *PDT);
+                    bool needsCFL = AllBranches || branchNeedsCFL(Loop->getExitingBlock(), ifConditions, loops, *DT, PDT);
                     if (needsCFL)
-                        extracted = doExtractLoop(F, Loop, *DT, *PDT, LI, ("__cfl_loop_"+F.getName().str()).c_str());
+                        extracted = doExtractLoop(F, Loop, *DT, PDT, LI, ("__cfl_loop_"+F.getName().str()).c_str());
                     else
-                        extracted = doExtractLoop(F, Loop, *DT, *PDT, LI, ("loop_"+F.getName().str()).c_str());
+                        extracted = doExtractLoop(F, Loop, *DT, PDT, LI, ("loop_"+F.getName().str()).c_str());
                     // Do one at a time, since we modify BBs in doExtract
                     // qprint("extraction of loop " << (extracted? " success":" failed"));
                     if (extracted) {

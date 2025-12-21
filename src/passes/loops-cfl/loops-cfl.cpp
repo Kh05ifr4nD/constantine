@@ -3,11 +3,19 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <random>
+#include <set>
+#include <utility>
+#include <cmath>
 
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
@@ -32,6 +40,11 @@ static cl::opt<std::string>
 ConfigFilename("loops-cfl-conf",
     cl::desc("The file to load config from, for the initial values of `max_count`"),
     cl::init(""), cl::NotHidden);
+
+static cl::opt<unsigned long>
+DefaultMaxCount("loops-cfl-default-max",
+    cl::desc("Fallback initializer for `max_count` when no config entry is present (0 disables fallback)"),
+    cl::init(0), cl::NotHidden);
 
 static cl::opt<bool>
 DumpConf("loops-cfl-dump-conf",
@@ -101,11 +114,22 @@ namespace {
         return ConstantInt::get(C, APInt(sizeof(unsigned char)*8, value));
     }
 
-    bool hasTaintMetadata(Instruction *I) {
-        MDNode* N;
-        N = I->getMetadata("t");
-        return N != NULL;
-    }
+	    bool hasTaintMetadata(Instruction *I) {
+	        MDNode* N;
+	        N = I->getMetadata("t");
+	        return N != NULL;
+	    }
+
+	    bool getInstructionTaint(Instruction &I) {
+	        MDNode* N;
+	        Constant *val;
+	        N = I.getMetadata("t");
+	        if (N == NULL) return false;
+	        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
+	        if (!val) return false;
+	        int taint = cast<ConstantInt>(val)->getSExtValue();
+	        return taint != 0;
+	    }
 
     void dumpIDs(llvm::Instruction& I, llvm::BasicBlock &BB, int taint){
         MDNode* N;
@@ -165,8 +189,6 @@ namespace {
 
     // Obtain a random value to use in place of an undef value, which appears safer
     Value *getPoison(Type* T, Function *F) {
-        static DataLayout* DL = new DataLayout(F->getParent());
-
         // Seed with a real random value, if available
         static std::random_device rd;
         std::mt19937_64 e2(rd());
@@ -175,7 +197,8 @@ namespace {
         // unsigned long long randValue = 0x1111111100001100uL | (protectedLoops << 16uL) | (dist(e2) & 0xff);
 
         LLVMContext &C = F->getContext();
-        uint64_t valSize = DL->getTypeSizeInBits(T); 
+        const DataLayout &DL = F->getParent()->getDataLayout();
+        uint64_t valSize = DL.getTypeSizeInBits(T); 
 
         if (T->isPointerTy()) return CastInst::Create(CastInst::IntToPtr, ConstantInt::get(C, APInt(valSize, randValue)), T, "", &*F->getEntryBlock().getFirstInsertionPt());
         
@@ -195,30 +218,121 @@ namespace {
 
         BasicBlock* PreheaderBlock = L->getLoopPreheader();
         BasicBlock* HeaderBlock = L->getHeader();
-        BasicBlock* ExitingBlock   = L->getExitingBlock();
-        BranchInst* ExitingBranch  = dyn_cast<BranchInst>(ExitingBlock->getTerminator());
-        BasicBlock* ExitBlock      = L->getExitBlock();
+
+        // StrictCT: loops may have multiple exiting blocks (e.g. one exit to an
+        // outer loop and one exit to the function epilogue). For loops-cfl we
+        // specifically linearize tainted exit checks; pick the unique tainted
+        // conditional branch that exits the current loop.
+        BasicBlock* ExitingBlock = nullptr;
+        BasicBlock* ExitBlock = nullptr;
+        BranchInst* ExitingBranch = nullptr;
+        llvm::SmallVector<llvm::BasicBlock*, 16> ExitingBlocks;
+        L->getExitingBlocks(ExitingBlocks);
+        for (llvm::BasicBlock* BB : ExitingBlocks) {
+            if (!BB)
+                continue;
+            llvm::BranchInst *BI = dyn_cast<llvm::BranchInst>(BB->getTerminator());
+            if (!BI || !BI->isConditional())
+                continue;
+            if (!getInstructionTaint(*BI))
+                continue;
+            llvm::BasicBlock *S0 = BI->getSuccessor(0);
+            llvm::BasicBlock *S1 = BI->getSuccessor(1);
+            const bool s0_in = L->contains(S0);
+            const bool s1_in = L->contains(S1);
+            if (s0_in == s1_in) {
+                // both in-loop or both out-of-loop: not a simple exit/continue branch.
+                continue;
+            }
+            llvm::BasicBlock *Outside = s0_in ? S1 : S0;
+            if (ExitingBranch && ExitingBranch != BI) {
+                errs() << "[loops-cfl] multiple tainted loop exits in function '"
+                       << F->getName()
+                       << "'; cannot linearize safely\n";
+                report_fatal_error("loops-cfl: multiple tainted exits unsupported");
+            }
+            ExitingBranch = BI;
+            ExitingBlock = BB;
+            ExitBlock = Outside;
+        }
+
+        if (!PreheaderBlock || !HeaderBlock || !ExitingBlock || !ExitBlock ||
+            !ExitingBranch) {
+            errs() << "[loops-cfl] unsupported tainted loop in function '"
+                   << F->getName()
+                   << "' (needs preheader + tainted conditional exit branch)\n";
+            report_fatal_error("loops-cfl: unsupported tainted loop form");
+        }
 
         int branchBGID = getBGID(*ExitingBranch);
         int branchIBID = getIBID(*ExitingBranch);
 
         Value *LoopCond = ExitingBranch->getCondition();
-        assert(PreheaderBlock && ExitingBlock && ExitBlock && HeaderBlock);
-        assert(ExitBlock == ExitingBranch->getSuccessor(0));
-        assert(PreheaderBlock->getUniqueSuccessor() == HeaderBlock);
-        assert(HeaderBlock == ExitingBranch->getSuccessor(1));
+        // Constantine expects the exiting branch to be of the form:
+        //   br would_exit, exit, continue
+        // Some frontends generate the opposite ordering (continue condition).
+        // Normalize by swapping successors and inverting the condition when
+        // needed.
+        BasicBlock *Succ0 = ExitingBranch->getSuccessor(0);
+        BasicBlock *Succ1 = ExitingBranch->getSuccessor(1);
+        if (Succ0 != ExitBlock && Succ1 == ExitBlock && L->contains(Succ0)) {
+            // Condition is "continue" → make it "exit".
+            if (auto *C = dyn_cast<Constant>(LoopCond)) {
+                LoopCond = ConstantExpr::getNot(C);
+            } else {
+                Instruction *InsertPt = ExitingBranch;
+                LoopCond =
+                    BinaryOperator::CreateNot(LoopCond, "loop_exit.inv", InsertPt);
+            }
+            ExitingBranch->setCondition(LoopCond);
+            ExitingBranch->swapSuccessors();
+        }
+
+        if (ExitBlock != ExitingBranch->getSuccessor(0) ||
+            !L->contains(ExitingBranch->getSuccessor(1)) ||
+            PreheaderBlock->getUniqueSuccessor() != HeaderBlock) {
+            errs() << "[loops-cfl] tainted loop has unexpected successor layout in function '"
+                   << F->getName() << "'\n";
+            report_fatal_error("loops-cfl: unsupported tainted loop successor layout");
+        }
 
         if (!PreheaderFunc) {
-            PreheaderFunc = M->getFunction("cfl_loop_preheader");
-            ExitingFunc   = M->getFunction("cfl_loop_exiting");
-            ExitFunc      = M->getFunction("cfl_loop_exit");
-            DumpFunc      = M->getFunction("cfl_loop_dump_count");
+            LLVMContext &Ctx = M->getContext();
+            Type *VoidTy = Type::getVoidTy(Ctx);
+            Type *PtrTy = PointerType::getUnqual(Ctx);
+            Type *I1 = Type::getInt1Ty(Ctx);
+            Type *I32 = Type::getInt32Ty(Ctx);
+
+            PreheaderFunc = dyn_cast<Function>(
+                M->getOrInsertFunction(
+                     "cfl_loop_preheader",
+                     FunctionType::get(VoidTy, {PtrTy, PtrTy, I32, I32}, false))
+                    .getCallee());
+            ExitingFunc = dyn_cast<Function>(
+                M->getOrInsertFunction(
+                     "cfl_loop_exiting",
+                     FunctionType::get(I1, {PtrTy, PtrTy, I1}, false))
+                    .getCallee());
+            ExitFunc = dyn_cast<Function>(
+                M->getOrInsertFunction(
+                     "cfl_loop_exit",
+                     FunctionType::get(VoidTy, {PtrTy, PtrTy}, false))
+                    .getCallee());
+            DumpFunc = dyn_cast<Function>(
+                M->getOrInsertFunction(
+                     "cfl_loop_dump_count",
+                     FunctionType::get(VoidTy, {PtrTy, I1, I32, I32}, false))
+                    .getCallee());
         }
         assert(PreheaderFunc && ExitingFunc && ExitFunc && DumpFunc);
 
         // Create locals to pass to wrappers
-        AllocaInst *AITmp = new AllocaInst(PreheaderFunc->getParamByValType(0), 0, "loop_cfl_tmp", &*(F->getEntryBlock().getFirstInsertionPt()));
-        AllocaInst *AICount = new AllocaInst(ExitFunc->getParamByValType(1), 0, "loop_cfl_count", &*(F->getEntryBlock().getFirstInsertionPt()));
+        AllocaInst *AITmp = new AllocaInst(Type::getInt1Ty(M->getContext()), 0,
+                                           "loop_cfl_tmp",
+                                           &*(F->getEntryBlock().getFirstInsertionPt()));
+        AllocaInst *AICount =
+            new AllocaInst(Type::getInt64Ty(M->getContext()), 0, "loop_cfl_count",
+                           &*(F->getEntryBlock().getFirstInsertionPt()));
         const DataLayout &DL = AITmp->getParent()->getParent()->getParent()->getDataLayout();
         LLVMContext& C = AITmp->getContext();
         // Set lifetime start information
@@ -226,16 +340,22 @@ namespace {
         BuilderStart.CreateLifetimeStart(AITmp, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AITmp->getAllocatedType())));
         BuilderStart.CreateLifetimeStart(AICount, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AICount->getAllocatedType())));
 
-        // Create per-loop exiting block global variable
-        Type* uLongType = IntegerType::getInt64Ty(M->getContext());
-        unsigned long init_value = maxCountInit[std::make_pair(branchBGID, branchIBID)];
-        ConstantInt* const_long_val = ConstantInt::get(M->getContext(), APInt(64,init_value));
-        std::string globalName = "loop_cfl_glob_" + ExitingBlock->getName().str() + F->getName().str() + std::to_string(getUniqueID());
+	        // Create per-loop exiting block global variable
+	        Type* uLongType = IntegerType::getInt64Ty(M->getContext());
+	        auto key = std::make_pair(branchBGID, branchIBID);
+	        unsigned long init_value = 0;
+	        auto It = maxCountInit.find(key);
+	        if (It != maxCountInit.end())
+	            init_value = It->second;
+	        if (init_value == 0 && DefaultMaxCount > 0)
+	            init_value = DefaultMaxCount;
+	        ConstantInt* const_long_val = ConstantInt::get(M->getContext(), APInt(64,init_value));
+	        std::string globalName = "loop_cfl_glob_" + ExitingBlock->getName().str() + F->getName().str() + std::to_string(getUniqueID());
 
         M->getOrInsertGlobal(globalName,uLongType);
         GlobalVariable *ExitingMaxCount = M->getNamedGlobal(globalName);
         ExitingMaxCount->setLinkage(GlobalValue::InternalLinkage);
-        ExitingMaxCount->setAlignment(8);
+        ExitingMaxCount->setAlignment(Align(8));
         ExitingMaxCount->setInitializer(const_long_val);
         if (init_value) {
             // oprint(protectedLoops << " " << globalName << " - BGID: " << branchBGID << " - IBID: " << branchIBID << " - init: " << init_value);
@@ -267,16 +387,52 @@ namespace {
             ExitingBranch->setCondition(ShouldExit);
         }
 
-        // Call exit wrapper
-        std::vector<Value*> ExitFuncArgs;
-        ExitFuncArgs.push_back(AITmp);
-        ExitFuncArgs.push_back(AICount);
-        CallInst *ExitCall = CallInst::Create(ExitFunc, ExitFuncArgs, "", &*(ExitBlock->getFirstInsertionPt()));
+        // Insert exit wrappers on *all* exit edges from the loop.
+        // In LCSSA/loop-simplify form, a tainted loop can still have multiple
+        // exit blocks (e.g., exit to epilogue vs. exit to an outer region).
+        // We must restore `taken`/reset counters on every possible exit path,
+        // otherwise we may leave dummy mode enabled after an early exit.
+        llvm::SmallVector<llvm::BasicBlock*, 16> AllExitBlocks;
+        L->getExitBlocks(AllExitBlocks);
+        for (llvm::BasicBlock* EB : AllExitBlocks) {
+            if (!EB)
+                continue;
+            for (llvm::BasicBlock* Pred : predecessors(EB)) {
+                if (!Pred || !L->contains(Pred))
+                    continue;
 
-        // Create lifetime end at the exit point
-        llvm::IRBuilder<> BuilderEnd(ExitCall->getNextNode());
-        BuilderEnd.CreateLifetimeEnd(AITmp, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AITmp->getAllocatedType())));
-        BuilderEnd.CreateLifetimeEnd(AICount, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AICount->getAllocatedType())));
+                BasicBlock *Tramp = BasicBlock::Create(
+                    M->getContext(),
+                    "loop_cfl_exit_" + EB->getName().str() + "_" +
+                        Pred->getName().str(),
+                    F, EB);
+
+                std::vector<Value*> ExitFuncArgs;
+                ExitFuncArgs.push_back(AITmp);
+                ExitFuncArgs.push_back(AICount);
+                CallInst *ExitCall = CallInst::Create(ExitFunc, ExitFuncArgs, "", Tramp);
+
+                BranchInst::Create(EB, Tramp);
+
+                // Lifetime end at the exit edge.
+                llvm::IRBuilder<> BuilderEnd(Tramp->getTerminator());
+                BuilderEnd.CreateLifetimeEnd(
+                    AITmp, ConstantInt::get(Type::getInt64Ty(C),
+                                            DL.getTypeAllocSize(AITmp->getAllocatedType())));
+                BuilderEnd.CreateLifetimeEnd(
+                    AICount, ConstantInt::get(Type::getInt64Ty(C),
+                                              DL.getTypeAllocSize(AICount->getAllocatedType())));
+
+                // Redirect the exiting edge Pred -> EB to Pred -> Tramp -> EB.
+                Instruction *TI = Pred->getTerminator();
+                assert(TI && TI->isTerminator());
+                for (unsigned si = 0; si < TI->getNumSuccessors(); ++si) {
+                    if (TI->getSuccessor(si) == EB)
+                        TI->setSuccessor(si, Tramp);
+                }
+                EB->replacePhiUsesWith(Pred, Tramp);
+            }
+        }
 
         // blacklist of values we must be sure to not wrap
         std::set<Value*> blacklist;
@@ -306,7 +462,13 @@ namespace {
 
         // an escaping value and its uses
         std::map<Instruction*, std::set<Instruction*>> escapingValuesAndUses;
-        static GlobalVariable* CFL_taken_ref = M->getNamedGlobal("taken");
+        GlobalVariable* CFL_taken_ref = nullptr;
+        if (auto *GV = M->getNamedGlobal("taken")) {
+            CFL_taken_ref = GV;
+        } else {
+            M->getOrInsertGlobal("taken", Type::getInt1Ty(M->getContext()));
+            CFL_taken_ref = M->getNamedGlobal("taken");
+        }
         assert(CFL_taken_ref);
         for(BasicBlock *BB: L->getBlocks()) {
             for (Instruction &I: *BB) {
@@ -317,7 +479,7 @@ namespace {
                 // it will not write to useful memory in dummy mode (in the
                 // CFL), or will just touch memory (in the DFL model).
                 if (CallInst *CI = dyn_cast<CallInst>(I.stripPointerCasts())) {
-                    if (!CI->getCalledFunction() || CI->getCalledFunction()->getName().equals("cfl_ptr_wrap") || CI->getCalledFunction()->getName().equals("dfl_ptr_wrap")) {
+                    if (!CI->getCalledFunction() || CI->getCalledFunction()->getName() == "cfl_ptr_wrap" || CI->getCalledFunction()->getName() == "dfl_ptr_wrap") {
                         continue;
                     }
                 }
@@ -337,7 +499,6 @@ namespace {
                         // assert lcssa form to be sure we are in the right form
                         assert(isa<PHINode>(use));
                         static std::string lcssa_str = ".lcssa";
-                        assert(use->getParent() == ExitBlock);
                         assert((use->getName().str().length() - lcssa_str.length()) >= 0);
                         // too strict! (e.g. val.lcssa1)
                         // assert(!use->getName().str().compare(use->getName().str().length() - lcssa_str.length(), lcssa_str.length(), lcssa_str));
@@ -386,10 +547,10 @@ namespace {
                         // Check that we are not dealing with an helper of ours
                         Function *F = dyn_cast<CallInst>(use)->getCalledFunction();
                         if (F == nullptr ||
-                            (      F->getSection().equals("dfl_code") 
-                                || F->getSection().equals("cfl_code") 
-                                || F->getSection().equals("cgc_code") 
-                                || F->getSection().equals("icp_code"))) {
+                            (      F->getSection() == "dfl_code" 
+                                || F->getSection() == "cfl_code" 
+                                || F->getSection() == "cgc_code" 
+                                || F->getSection() == "icp_code")) {
                             continue;
                         }
                         escapingValuesAndUses[&I].insert(use);
@@ -398,9 +559,16 @@ namespace {
             }
         }
 
-        // Check we did not insert any value, that is present in the blacklist
-        for(auto VandUses: escapingValuesAndUses) {
-            assert(blacklist.find(VandUses.first->stripPointerCasts()) == blacklist.end());
+        // Some synthetic loop bookkeeping values (tmp/count/cond) may end up
+        // looking like "escaping" values after prior transforms. Never attempt
+        // to wrap these; just ignore them.
+        for (auto It = escapingValuesAndUses.begin();
+             It != escapingValuesAndUses.end();) {
+            if (blacklist.find(It->first->stripPointerCasts()) != blacklist.end()) {
+                It = escapingValuesAndUses.erase(It);
+                continue;
+            }
+            ++It;
         }
 
         // Transform each escaping value such that:
@@ -460,9 +628,14 @@ namespace {
 
             // Insert the select to choose if update the value or not
             // ...load the `taken` value first (it's a global)
-            LoadInst* takenVal = new LoadInst(CFL_taken_ref, "", /*isVolatile=*/true, insertionPoint);
-            Value *boolTaken   = new ICmpInst(insertionPoint, ICmpInst::ICMP_NE, 
-                takenVal, makeConstI8(F->getContext(), 0), "");
+            Type *TakenTy = CFL_taken_ref->getValueType();
+            LoadInst* takenVal = new LoadInst(TakenTy, CFL_taken_ref, "", /*isVolatile=*/true,
+                                              Align(1), insertionPoint);
+            Value *boolTaken = takenVal;
+            if (!boolTaken->getType()->isIntegerTy(1)) {
+                boolTaken = new ICmpInst(insertionPoint, ICmpInst::ICMP_NE, takenVal,
+                                         ConstantInt::get(takenVal->getType(), 0), "");
+            }
 
             SelectInst *Sel = SelectInst::Create(boolTaken, escapingValue, lastValid, "escaping_val", insertionPoint);
             lastValid->addIncoming(Sel, ExitingBlock); 
@@ -476,7 +649,7 @@ namespace {
         // if (!DumpConf) {
         //     assert(ShouldExit->getNextNode() == ExitingBranch);
         // }
-        assert(&*(ExitBlock->getFirstInsertionPt()) == ExitCall);
+        // Exit wrappers are inserted via per-edge trampolines; no single ExitCall.
 
         // Add llvm.loop.unroll.disable metadata to the loop
         setLoopNoUnroll(L);
@@ -491,39 +664,43 @@ namespace {
         passListRegexInit(FunctionRegexes, Functions);
 
         Function *F = L->getHeader()->getParent();
-        if (F->getSection().equals("dfl_code") || F->getSection().equals("cfl_code") 
-                || F->getSection().equals("cgc_code") || F->getSection().equals("icp_code"))
+        if (F->getSection() == "dfl_code" || F->getSection() == "cfl_code" 
+                || F->getSection() == "cgc_code" || F->getSection() == "icp_code")
             return false;
 
         ++totalLoops;
 
-        const std::string &FName = L->getHeader()->getParent()->getName();
+        std::string FName = L->getHeader()->getParent()->getName().str();
         if (!passListRegexMatch(FunctionRegexes, FName))
             return false;
 
-        if (skipLoop(L)) {
-            assert(false);
-            return false;
-        }
-        // llvm::SmallVector<llvm::BasicBlock*, 16> ExitingBlocks;
-        // MDNode* N;
-        // Constant *val;
-        // L->getExitingBlocks(ExitingBlocks);
-        
-        // for(llvm::BasicBlock* BB: ExitingBlocks) {
-        //     llvm::BranchInst *EndBranch = dyn_cast<BranchInst>(BB->getTerminator());
-        //     N = EndBranch->getMetadata("t");
-        //     if (N == NULL) continue;
-        //     val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        //     assert(val);
-        //     int taint = cast<ConstantInt>(val)->getSExtValue();
-        //     dumpIDs(*EndBranch, *BB, taint);
-        // }
+	        if (skipLoop(L)) {
+	            return false;
+	        }
 
-        ++protectedLoops;
-        loops_cfl(L);
-        return true;
-    }
+	        // StrictCT: only linearize loops whose exit condition depends on secrets.
+	        // The upstream pass can be applied to all loops, but that can be
+	        // prohibitively expensive for fixed-count loops inside hot paths.
+	        bool shouldProtect = false;
+	        llvm::SmallVector<llvm::BasicBlock*, 16> ExitingBlocks;
+	        L->getExitingBlocks(ExitingBlocks);
+	        for(llvm::BasicBlock* BB: ExitingBlocks) {
+	            llvm::BranchInst *EndBranch = dyn_cast<BranchInst>(BB->getTerminator());
+	            if (!EndBranch || !EndBranch->isConditional())
+	                continue;
+	            if (getInstructionTaint(*EndBranch)) {
+	                shouldProtect = true;
+	                break;
+	            }
+	        }
+	        if (!shouldProtect) {
+	            return false;
+	        }
+
+	        ++protectedLoops;
+	        loops_cfl(L);
+	        return true;
+	    }
   };
 
 }

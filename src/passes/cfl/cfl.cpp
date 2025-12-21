@@ -1,6 +1,7 @@
 
 #include <pass.h>
 
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -131,7 +132,7 @@ namespace {
         return value? BoolTrue : BoolFalse;
     }
 
-    void wrapIntrinsicCall(CallSite &CS, Function *Callee) {
+    void wrapIntrinsicCall(CallBase &CB, Function *Callee) {
         const char *wrapper = NULL;
         switch(Callee->getIntrinsicID()) {
         case Intrinsic::memcpy:
@@ -146,27 +147,50 @@ namespace {
         default:
             return;
         }
-        Function *NewCallee = Callee->getParent()->getFunction(wrapper);
-        CS.setCalledFunction(NewCallee);
+        Module *M = Callee->getParent();
+        Function *NewCallee = M->getFunction(wrapper);
+        if (!NewCallee) {
+            FunctionType *FTy = Callee->getFunctionType();
+            FunctionCallee Decl = M->getOrInsertFunction(wrapper, FTy);
+            NewCallee = dyn_cast<Function>(Decl.getCallee());
+        }
+        if (NewCallee)
+            CB.setCalledFunction(NewCallee);
     }
 
-    void wrapExtCall(CallSite &CS, Function *Callee) {
-        static Function *F = Callee->getParent()->getFunction("cfl_fptr_wrap");
+    void wrapExtCall(CallBase &CB, Function *Callee) {
+        Module *M = Callee->getParent();
+        LLVMContext &Ctx = M->getContext();
+        Type *PtrTy = PointerType::getUnqual(Ctx);
+        FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy}, false);
+        FunctionCallee Wrap = M->getOrInsertFunction("cfl_fptr_wrap", FTy);
+        Function *F = dyn_cast<Function>(Wrap.getCallee());
         assert(F);
         std::vector<Value*> args;
-        args.push_back(CastInst::CreatePointerCast(Callee, F->getParamByValType(0)->getPointerTo(), "", CS.getInstruction()));
-        CallInst *CI = CallInst::Create(F, args, "", CS.getInstruction());
-        CS.setCalledFunction(CastInst::CreatePointerCast(CI, Callee->getType(), "", CS.getInstruction()));
+        Type *Param0 = F->getFunctionType()->getParamType(0);
+        args.push_back(
+            CastInst::CreatePointerCast(Callee, Param0, "", &CB));
+        CallInst *CI = CallInst::Create(F, args, "", &CB);
+        Value *NewCallee =
+            CastInst::CreatePointerCast(CI, CB.getCalledOperand()->getType(),
+                                        "", &CB);
+        CB.setCalledOperand(NewCallee);
     }
 
     void wrapLoad(LoadInst *LI) {
-        static Function *F = LI->getParent()->getParent()->getParent()->getFunction("cfl_ptr_wrap");
+        Module *M = LI->getParent()->getParent()->getParent();
+        LLVMContext &Ctx = M->getContext();
+        Type *PtrTy = PointerType::getUnqual(Ctx);
+        FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy}, false);
+        FunctionCallee Wrap = M->getOrInsertFunction("cfl_ptr_wrap", FTy);
+        Function *F = dyn_cast<Function>(Wrap.getCallee());
         static InlineFunctionInfo IFI;
         assert(F);
         std::vector<Value*> args;
-        args.push_back(CastInst::CreatePointerCast(LI->getPointerOperand(), F->getParamByValType(0)->getPointerTo(), "", LI));
+        args.push_back(CastInst::CreatePointerCast(
+            LI->getPointerOperand(), F->getFunctionType()->getParamType(0), "",
+            LI));
         CallInst *CI = CallInst::Create(F, args, "", LI);
-        CallSite CS(CI);
         LI->setOperand(0, CastInst::CreatePointerCast(CI, LI->getPointerOperandType(), "", LI));
         // do not inline now to avoid loops-cfl detecting this as an escaping value
         // due to the call to an unrecognized function
@@ -174,13 +198,19 @@ namespace {
     }
 
     void wrapStore(StoreInst *SI) {
-        static Function *F = SI->getParent()->getParent()->getParent()->getFunction("cfl_ptr_wrap");
+        Module *M = SI->getParent()->getParent()->getParent();
+        LLVMContext &Ctx = M->getContext();
+        Type *PtrTy = PointerType::getUnqual(Ctx);
+        FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy}, false);
+        FunctionCallee Wrap = M->getOrInsertFunction("cfl_ptr_wrap", FTy);
+        Function *F = dyn_cast<Function>(Wrap.getCallee());
         static InlineFunctionInfo IFI;
         assert(F);
         std::vector<Value*> args;
-        args.push_back(CastInst::CreatePointerCast(SI->getPointerOperand(), F->getParamByValType(0)->getPointerTo(), "", SI));
+        args.push_back(CastInst::CreatePointerCast(
+            SI->getPointerOperand(), F->getFunctionType()->getParamType(0), "",
+            SI));
         CallInst *CI = CallInst::Create(F, args, "", SI);
-        CallSite CS(CI);
         SI->setOperand(1, CastInst::CreatePointerCast(CI, SI->getPointerOperandType(), "", SI));
         // do not inline now to avoid loops-cfl detecting this as an escaping value
         // due to the call to an unrecognized function
@@ -197,7 +227,12 @@ namespace {
         BasicBlock *IfHeader = IFC.Branch->getParent();
         Value *IfCond = IFC.Branch->getCondition();
         if (!CondF) {
-            CondF = F->getParent()->getFunction("cfl_br_get_fixed");
+            Module *M = F->getParent();
+            LLVMContext &Ctx = M->getContext();
+            Type *I1 = Type::getInt1Ty(Ctx);
+            FunctionType *FTy = FunctionType::get(I1, {I1, I1}, false);
+            FunctionCallee Cal = M->getOrInsertFunction("cfl_br_get_fixed", FTy);
+            CondF = dyn_cast<Function>(Cal.getCallee());
         }
 
         int branchBGID = getBGID(*IFC.Branch);
@@ -228,19 +263,43 @@ namespace {
         BasicBlock *IfHeader = IFC.Branch->getParent();
         Value *IfCond = IFC.Branch->getCondition();
         if (!CondF) {
-            CondF = F->getParent()->getFunction("cfl_br_cond");
-            IfTrueF = F->getParent()->getFunction("cfl_br_iftrue");
-            IfFalseF = F->getParent()->getFunction("cfl_br_iffalse");
-            MergePointF = F->getParent()->getFunction("cfl_br_merge");
+            Module *M = F->getParent();
+            LLVMContext &Ctx = M->getContext();
+            Type *VoidTy = Type::getVoidTy(Ctx);
+            Type *PtrTy = PointerType::getUnqual(Ctx);
+            Type *I1 = Type::getInt1Ty(Ctx);
+            FunctionCallee CondCal =
+                M->getOrInsertFunction("cfl_br_cond",
+                                       FunctionType::get(VoidTy, {PtrTy}, false));
+            FunctionCallee IfTrueCal = M->getOrInsertFunction(
+                "cfl_br_iftrue", FunctionType::get(VoidTy, {PtrTy, I1}, false));
+            FunctionCallee IfFalseCal =
+                M->getOrInsertFunction("cfl_br_iffalse",
+                                       FunctionType::get(VoidTy, {PtrTy, I1}, false));
+            FunctionCallee MergeCal =
+                M->getOrInsertFunction("cfl_br_merge",
+                                       FunctionType::get(VoidTy, {PtrTy}, false));
+            CondF = dyn_cast<Function>(CondCal.getCallee());
+            IfTrueF = dyn_cast<Function>(IfTrueCal.getCallee());
+            IfFalseF = dyn_cast<Function>(IfFalseCal.getCallee());
+            MergePointF = dyn_cast<Function>(MergeCal.getCallee());
         }
 
         // Create local to pass to wrappers
-        AllocaInst *AITmp = new AllocaInst(CondF->getParamByValType(0), 0, "cfl_tmp", &*(F->getEntryBlock().getFirstInsertionPt()));
+        LLVMContext &C = F->getContext();
+        AllocaInst *AITmp = new AllocaInst(Type::getInt1Ty(C), 0, "cfl_tmp",
+                                           &*(F->getEntryBlock().getFirstInsertionPt()));
         const DataLayout &DL = AITmp->getParent()->getParent()->getParent()->getDataLayout();
-        LLVMContext& C = AITmp->getContext();
         // Set lifetime start information
         llvm::IRBuilder<> BuilderStart(AITmp->getNextNode());
         BuilderStart.CreateLifetimeStart(AITmp, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AITmp->getAllocatedType())));
+
+        // The branch condition may not dominate the serialized IfFalse path when
+        // the original true/false regions contain loops. Store it once in the
+        // header and reload it where needed to keep SSA dominance valid.
+        AllocaInst *AICond = new AllocaInst(
+            Type::getInt1Ty(C), 0, "cfl_cond",
+            &*(F->getEntryBlock().getFirstInsertionPt()));
 #if 0
         errs() << IFC.MergePoint->getName() << "\n";
         IfCond->print(errs()); errs() << "\n";
@@ -250,6 +309,11 @@ namespace {
 
         int branchBGID = getBGID(*IFC.Branch);
         int branchIBID = getIBID(*IFC.Branch);
+
+        // Store the original condition in the header. This is required because
+        // after CFL serializes execution, the IfFalse region may be reached via
+        // paths (e.g., loops) that do not preserve SSA dominance of IfCond.
+        new StoreInst(IfCond, AICond, IfHeader->getTerminator());
 
         // Call wrappers
         std::vector<Value*> CondFArgs;
@@ -264,15 +328,21 @@ namespace {
         if (IFC.IfTrue != IFC.MergePoint) {
             std::vector<Value*> IfTrueFArgs;
             IfTrueFArgs.push_back(AITmp);
-            IfTrueFArgs.push_back(IfCond);
-            CallInst::Create(IfTrueF, IfTrueFArgs, "", &*(IFC.IfTrue->getFirstInsertionPt()));
+            Instruction *IfTrueIP = &*(IFC.IfTrue->getFirstInsertionPt());
+            LoadInst *CondTrue =
+                new LoadInst(Type::getInt1Ty(C), AICond, "", IfTrueIP);
+            IfTrueFArgs.push_back(CondTrue);
+            CallInst::Create(IfTrueF, IfTrueFArgs, "", IfTrueIP);
         }
 
         if (IFC.IfFalse != IFC.MergePoint) {
             std::vector<Value*> IfFalseFArgs;
             IfFalseFArgs.push_back(AITmp);
-            IfFalseFArgs.push_back(IfCond);
-            CallInst::Create(IfFalseF, IfFalseFArgs, "", &*(IFC.IfFalse->getFirstInsertionPt()));
+            Instruction *IfFalseIP = &*(IFC.IfFalse->getFirstInsertionPt());
+            LoadInst *CondFalse =
+                new LoadInst(Type::getInt1Ty(C), AICond, "", IfFalseIP);
+            IfFalseFArgs.push_back(CondFalse);
+            CallInst::Create(IfFalseF, IfFalseFArgs, "", IfFalseIP);
         }
 
         std::vector<Value*> MergePointFArgs;
@@ -284,11 +354,15 @@ namespace {
         BuilderEnd.CreateLifetimeEnd(AITmp, ConstantInt::get(Type::getInt64Ty(C), DL.getTypeAllocSize(AITmp->getAllocatedType())));
 
         // Turn any PHIs into Selects in MergePoint block
+        Instruction *MergeIP = &*(IFC.MergePoint->getFirstInsertionPt());
+        LoadInst *CondMerge =
+            new LoadInst(Type::getInt1Ty(C), AICond, "", MergeIP);
         while (PHINode *PN = dyn_cast<PHINode>(IFC.MergePoint->begin())) {
             assert(PN->getNumIncomingValues() == 2);
             Value *TrueVal = PN->getIncomingValue(PN->getIncomingBlock(0) == IFC.IfTruePred ? 0 : 1);
             Value *FalseVal = PN->getIncomingValue(PN->getIncomingBlock(0) == IFC.IfTruePred ? 1 : 0);
-            Value *Sel = SelectInst::Create(IfCond, TrueVal, FalseVal, "", &*(IFC.MergePoint->getFirstInsertionPt()));
+            Value *Sel = SelectInst::Create(CondMerge, TrueVal, FalseVal, "",
+                                            MergeIP);
             PN->replaceAllUsesWith(Sel);
             Sel->takeName(PN);
             PN->eraseFromParent();
@@ -310,6 +384,11 @@ namespace {
         // Remove conditional branch if IfTruePred != IfHeader
         // Otherwise we already fixed the jumps while connecting IfTrue to IFFalse
         if (IFC.IfTruePred != IfHeader) {
+            // We removed the direct edge IfHeader -> IfFalse and replaced it
+            // with IfTruePred -> IfFalse to serialize execution. Update PHI
+            // nodes in the IfFalse block accordingly, otherwise the CFG change
+            // leaves stale incoming blocks and breaks SSA form.
+            IFC.IfFalse->replacePhiUsesWith(IfHeader, IFC.IfTruePred);
             BranchInst::Create(IFC.IfTrue, IFC.Branch);
             IFC.Branch->eraseFromParent();
         }
@@ -377,7 +456,8 @@ namespace {
     void cfl(Function *F) {
         cflPassLog("CFLing " << F->getName());
         DominatorTree *DT = &getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
-        PostDominatorTree *PDT = &getAnalysis<PostDominatorTreeWrapperPass>(*F).getPostDomTree();
+        PostDominatorTree PDT;
+        PDT.recalculate(*F);
         F->addFnAttr("null-pointer-is-valid", "true");
 
         // Wrap loads, stores, memory intrinsics, and external calls
@@ -395,16 +475,16 @@ namespace {
                     continue;
                 }
             }
-            CallSite CS(&I);
-            if (!CS.getInstruction() || CS.isInlineAsm())
+            CallBase *CB = dyn_cast<CallBase>(&I);
+            if (!CB || CB->isInlineAsm())
                 continue; // not a call
-            Function *Callee = dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts());
+            Function *Callee = CB->getCalledFunction();
             if (!Callee)
                 continue; // not a direct call
             if (Callee->isIntrinsic())
-                wrapIntrinsicCall(CS, Callee);
+                wrapIntrinsicCall(*CB, Callee);
             else if (Callee->isDeclaration())
-                wrapExtCall(CS, Callee);
+                wrapExtCall(*CB, Callee);
         }
 
         if( BranchProtect == false) return;
@@ -416,7 +496,7 @@ namespace {
             if (!BI)
                 continue;
             if(BI->isConditional()) ++totalBranches;
-            IfCondition *IFC = getIfCondition(DT, PDT, BI);
+            IfCondition *IFC = getIfCondition(DT, &PDT, BI);
             if (!IFC)
                 continue;
             ++totalIFCs;
@@ -460,11 +540,11 @@ namespace {
             if (F.isDeclaration())
                 continue;
             ++totalFuncs;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
-            if (F.getSection().equals("dfl_code") || F.getSection().equals("cfl_code") 
-                || F.getSection().equals("cgc_code") || F.getSection().equals("icp_code"))
+            if (F.getSection() == "dfl_code" || F.getSection() == "cfl_code" ||
+                F.getSection() == "cgc_code" || F.getSection() == "icp_code")
                 continue;
             cflFunctionSet.insert(&F);
         }
@@ -486,7 +566,6 @@ namespace {
 
     void getAnalysisUsage(AnalysisUsage &AU) const {
         AU.addRequired<DominatorTreeWrapperPass>();
-        AU.addRequired<PostDominatorTreeWrapperPass>();
     }
 
   };
