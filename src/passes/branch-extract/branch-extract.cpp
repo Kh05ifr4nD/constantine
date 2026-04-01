@@ -15,6 +15,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
+#include <optional>
 #include <set>
 using namespace llvm;
 
@@ -158,15 +159,25 @@ namespace {
         return L;
     }
 
+    std::optional<int> getMetadataInt(MDNode *N) {
+        if (!N || N->getNumOperands() == 0)
+            return std::nullopt;
+
+        auto *Meta = dyn_cast<ConstantAsMetadata>(N->getOperand(0));
+        if (!Meta)
+            return std::nullopt;
+
+        auto *Val = dyn_cast<ConstantInt>(Meta->getValue());
+        if (!Val)
+            return std::nullopt;
+
+        return static_cast<int>(Val->getSExtValue());
+    }
+
     bool getInstructionTaint(Instruction &I) {
-        MDNode* N;
-        Constant *val;
-        N = I.getMetadata("t");
-        if (N == NULL) return false;
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int taint = cast<ConstantInt>(val)->getSExtValue();
-        return taint;
+        if (auto Taint = getMetadataInt(I.getMetadata("t")))
+            return *Taint;
+        return false;
     }
 
     void setInstructionTaint(Instruction &I, bool taint) {
@@ -491,7 +502,7 @@ namespace {
                     unidentified_branch = &BB;
                     continue;
                 }
-                if (SimpleBranches) {
+                if (SimpleBranches && IFC) {
                     // Only simple branches LLVM's GetIfCondition can handle
                     BasicBlock *IfTrue, *IfFalse;
                     if (!GetIfCondition(IFC->MergePoint, IfTrue, IfFalse))

@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <utility>
@@ -70,10 +71,16 @@ namespace {
     // Hold the max_count initialization value for each branch, if present in the configuration
     // <b_gid, i_bid> -> initial_value
     std::map<std::pair<int,int>,unsigned long> maxCountInit;
+    std::map<const BasicBlock *, int> syntheticBGIDs;
+    std::map<const Instruction *, int> syntheticIBIDs;
+    int nextSyntheticBGID;
+    int nextSyntheticIBID;
     unsigned long unique_id;
   public:
     static char ID;
     LoopsCFLPass() : LoopPass(ID) {
+        nextSyntheticBGID = -1;
+        nextSyntheticIBID = -1;
         unique_id = 0;
 
         // check if the configuration file is present, and load it if it is the case
@@ -131,41 +138,60 @@ namespace {
 	        return taint != 0;
 	    }
 
+    std::optional<int> getMetadataInt(MDNode *N) {
+        if (!N || N->getNumOperands() == 0)
+            return std::nullopt;
+
+        auto *Meta = dyn_cast<ConstantAsMetadata>(N->getOperand(0));
+        if (!Meta)
+            return std::nullopt;
+
+        auto *Val = dyn_cast<ConstantInt>(Meta->getValue());
+        if (!Val)
+            return std::nullopt;
+
+        return static_cast<int>(Val->getSExtValue());
+    }
+
+    int getOrCreateSyntheticBGID(const BasicBlock *BB) {
+        auto It = syntheticBGIDs.find(BB);
+        if (It != syntheticBGIDs.end())
+            return It->second;
+        int Assigned = nextSyntheticBGID--;
+        syntheticBGIDs.emplace(BB, Assigned);
+        return Assigned;
+    }
+
+    int getOrCreateSyntheticIBID(const Instruction *I) {
+        auto It = syntheticIBIDs.find(I);
+        if (It != syntheticIBIDs.end())
+            return It->second;
+        int Assigned = nextSyntheticIBID--;
+        syntheticIBIDs.emplace(I, Assigned);
+        return Assigned;
+    }
+
     void dumpIDs(llvm::Instruction& I, llvm::BasicBlock &BB, int taint){
-        MDNode* N;
-        Constant *val;
-        N = BB.getTerminator()->getMetadata("b-gid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int b_gid = cast<ConstantInt>(val)->getSExtValue();
-        N = I.getMetadata("i-bid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int i_bid = cast<ConstantInt>(val)->getSExtValue();
+        int b_gid = getBGID(*BB.getTerminator());
+        int i_bid = getIBID(I);
         std::cout << (taint == 1? "  loop:T00000:" : "  loop:0t0000:") << std::setfill('0') 
                  << std::setw(8) << b_gid << ":" << std::setfill('0') << std::setw(4) 
                  << i_bid << std::endl;
     }
 
     int getBGID(Instruction &I) {
-        MDNode* N;
-        Constant *val;
         BasicBlock *BB = I.getParent();
-        N = BB->getTerminator()->getMetadata("b-gid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int b_gid = cast<ConstantInt>(val)->getSExtValue();
-        return b_gid;
+        if (BB && BB->getTerminator()) {
+            if (auto ID = getMetadataInt(BB->getTerminator()->getMetadata("b-gid")))
+                return *ID;
+        }
+        return getOrCreateSyntheticBGID(BB);
     }
 
     int getIBID(Instruction &I) {
-        MDNode* N;
-        Constant *val;
-        N = I.getMetadata("i-bid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int i_bid = cast<ConstantInt>(val)->getSExtValue();
-        return i_bid;
+        if (auto ID = getMetadataInt(I.getMetadata("i-bid")))
+            return *ID;
+        return getOrCreateSyntheticIBID(&I);
     }
 
     ConstantInt* makeConstU64(LLVMContext &C, unsigned long value) {

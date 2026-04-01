@@ -1,5 +1,7 @@
 
 #include <pass.h>
+#include <map>
+#include <optional>
 
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
@@ -58,6 +60,10 @@ namespace {
     unsigned long linearizedBranches = 0;
     unsigned long totalBranches      = 0;
     unsigned long totalIFCs          = 0;
+    std::map<const BasicBlock *, int> syntheticBGIDs;
+    std::map<const Instruction *, int> syntheticIBIDs;
+    int nextSyntheticBGID = -1;
+    int nextSyntheticIBID = -1;
     
   public:
     static char ID;
@@ -73,10 +79,9 @@ namespace {
         MDNode* N;
         Constant *val;
         N = I.getMetadata("t");
-        assert(N);
         if (N == NULL) return false;
         val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
+        if (!val) return false;
         int taint = cast<ConstantInt>(val)->getSExtValue();
         return taint;
     }
@@ -101,25 +106,52 @@ namespace {
         return direction;
     }
 
+    std::optional<int> getMetadataInt(MDNode *N) {
+        if (!N || N->getNumOperands() == 0)
+            return std::nullopt;
+
+        auto *Meta = dyn_cast<ConstantAsMetadata>(N->getOperand(0));
+        if (!Meta)
+            return std::nullopt;
+
+        auto *Val = dyn_cast<ConstantInt>(Meta->getValue());
+        if (!Val)
+            return std::nullopt;
+
+        return static_cast<int>(Val->getSExtValue());
+    }
+
+    int getOrCreateSyntheticBGID(const BasicBlock *BB) {
+        auto It = syntheticBGIDs.find(BB);
+        if (It != syntheticBGIDs.end())
+            return It->second;
+        int Assigned = nextSyntheticBGID--;
+        syntheticBGIDs.emplace(BB, Assigned);
+        return Assigned;
+    }
+
+    int getOrCreateSyntheticIBID(const Instruction *I) {
+        auto It = syntheticIBIDs.find(I);
+        if (It != syntheticIBIDs.end())
+            return It->second;
+        int Assigned = nextSyntheticIBID--;
+        syntheticIBIDs.emplace(I, Assigned);
+        return Assigned;
+    }
+
     int getBGID(Instruction &I) {
-        MDNode* N;
-        Constant *val;
         BasicBlock *BB = I.getParent();
-        N = BB->getTerminator()->getMetadata("b-gid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int b_gid = cast<ConstantInt>(val)->getSExtValue();
-        return b_gid;
+        if (BB && BB->getTerminator()) {
+            if (auto ID = getMetadataInt(BB->getTerminator()->getMetadata("b-gid")))
+                return *ID;
+        }
+        return getOrCreateSyntheticBGID(BB);
     }
 
     int getIBID(Instruction &I) {
-        MDNode* N;
-        Constant *val;
-        N = I.getMetadata("i-bid");
-        val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
-        int i_bid = cast<ConstantInt>(val)->getSExtValue();
-        return i_bid;
+        if (auto ID = getMetadataInt(I.getMetadata("i-bid")))
+            return *ID;
+        return getOrCreateSyntheticIBID(&I);
     }
 
     ConstantInt* makeConstI32(LLVMContext &C, int value) {
