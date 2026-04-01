@@ -12,6 +12,7 @@
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include <map>
 #include <set>
 using namespace llvm;
 
@@ -93,7 +94,7 @@ namespace {
         for (auto &F : M.getFunctionList()) {
             if (F.isDeclaration())
                 continue;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
             functionSet.insert(&F);
@@ -113,4 +114,4 @@ namespace {
 }
 
 char RemoveDupLifetimesPass::ID = 0;
-RegisterPass<RemoveDupLifetimesPass> MP("remove-dup-lifetimes", "Remove Multiple Lifetimes Pass");
+RegisterPass<RemoveDupLifetimesPass> MP("psr-remove-dup-lifetimes", "Remove Multiple Lifetimes Pass");

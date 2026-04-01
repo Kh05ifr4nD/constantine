@@ -296,9 +296,10 @@ namespace {
         }
 
         CodeExtractor Extractor(BasicBlocks, &DT, false, nullptr, nullptr, AC);
+        CodeExtractorAnalysisCache CEAC(F);
 
         // qprint("is eligible? " << Extractor.isEligible());
-        Function* extractedFunc = Extractor.extractCodeRegion();
+        Function* extractedFunc = Extractor.extractCodeRegion(CEAC);
         if (extractedFunc != nullptr) {
             if (name)
                 extractedFunc->setName(name);
@@ -396,9 +397,10 @@ namespace {
 
         // CodeExtractor Extractor(DT, *L, false, nullptr, nullptr, AC);
         CodeExtractor Extractor(BasicBlocks, &DT, false, nullptr, nullptr, AC);
+        CodeExtractorAnalysisCache CEAC(F);
 
         // qprint("is eligible? " << Extractor.isEligible());
-        Function* extractedFunc = Extractor.extractCodeRegion();
+        Function* extractedFunc = Extractor.extractCodeRegion(CEAC);
         if (extractedFunc != nullptr) {
             if (name)
                 extractedFunc->setName(name);
@@ -584,7 +586,7 @@ namespace {
             if (F.isDeclaration())
                 continue;
             ++totalFunctions;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
             functionSet.insert(&F);
@@ -619,4 +621,4 @@ namespace {
 }
 
 char BranchExtractPass::ID = 0;
-RegisterPass<BranchExtractPass> MP("branch-extract", "Branch Extract Pass");
+RegisterPass<BranchExtractPass> MP("psr-branch-extract", "Branch Extract Pass");

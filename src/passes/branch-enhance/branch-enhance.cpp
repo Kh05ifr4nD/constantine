@@ -3,7 +3,9 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <set>
 
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -67,12 +69,20 @@ namespace {
 
     // Given a value, recursively search for all its implicit dependencies
     // and save them to the provided set
-    void searchDependencies(DominatorTree *DT, Value *V, std::set<Instruction*>&dependencies) {
+    void searchDependencies(DominatorTree *DT, Value *V, std::set<Instruction*>&dependencies,
+                            std::set<Value*>&visited) {
         // First, if the value is an inverted one (usually created by stucturize-cfg)
         // unwrap it
         Value *NotCondition;
         if (match(V, m_Not(m_Value(NotCondition))))
             V = NotCondition;
+
+        // Structurized CFG can still produce phi/select dependency cycles on
+        // real-world IR. Break value-graph recursion deterministically instead
+        // of recursing until stack exhaustion.
+        if (visited.find(V) != visited.end())
+            return;
+        visited.insert(V);
         
         // If the value is not an instruction it cannot have implicit deps
         // and it is not itself a dependency
@@ -87,7 +97,7 @@ namespace {
                     BasicBlock *IncomingBlock = Phi->getIncomingBlock(i);
                     
                     // Add the dependencies of the incoming val
-                    searchDependencies(DT, IncomingVal, dependencies);
+                    searchDependencies(DT, IncomingVal, dependencies, visited);
                     
                     // And add the condition leading to the phi node decision to the
                     // implicit dependencies
@@ -120,7 +130,7 @@ namespace {
 
                     assert(DT->dominates(IncomingBlock, BB));
                     Value *IncomingCond = IncomingTerm->getCondition();
-                    searchDependencies(DT, IncomingCond, dependencies);
+                    searchDependencies(DT, IncomingCond, dependencies, visited);
                 }
 
             // if the value is not a phi node, check if it is a compare
@@ -130,7 +140,7 @@ namespace {
             // otherwise visit all of the operands
             } else {
                 for (Value * op: I->operand_values()) {
-                    searchDependencies(DT, op, dependencies);
+                    searchDependencies(DT, op, dependencies, visited);
                 }
             }
         }
@@ -175,10 +185,12 @@ namespace {
             // condition of the FalseBB, if they match, they are part of a pair 
             // of if/else blocks
             std::set<Instruction*> BBdeps;
-            searchDependencies(DT, Cond, BBdeps);
+            std::set<Value*> BBvisited;
+            searchDependencies(DT, Cond, BBdeps, BBvisited);
 
             std::set<Instruction*> FalseBBdeps;
-            searchDependencies(DT, FalseCond, FalseBBdeps);
+            std::set<Value*> FalseBBvisited;
+            searchDependencies(DT, FalseCond, FalseBBdeps, FalseBBvisited);
 
             // check if the dependencies are the same
             // N.B: we define dependencies as the variable the branch depends on,
@@ -230,30 +242,38 @@ namespace {
             BasicBlock *IfEnd = nullptr;
             for (BasicBlock *pred : predecessors(FlowBB)) {
                 if (pred != IfHeader) {
-                    assert(!IfEnd);
+                    if (IfEnd) {
+                        IfEnd = nullptr;
+                        break;
+                    }
                     IfEnd = pred;
                 }
             }
-            assert(IfEnd);
+            if (!IfEnd)
+                continue;
 
             // The end of the else region is the predecessor of the merge point
             // which is not the elseBIBB
             BasicBlock *ElseEnd = nullptr;
             for (BasicBlock *pred : predecessors(MergeBlock)) {
                 if (pred != FlowBB) {
-                    assert(!ElseEnd);
+                    if (ElseEnd) {
+                        ElseEnd = nullptr;
+                        break;
+                    }
                     ElseEnd = pred;
                 }
             }
-            assert(ElseEnd);
+            if (!ElseEnd)
+                continue;
 
             // rewire the IFBranch to go to the else block when false
             IfBI->setSuccessor(1, ElseBlock);
 
             // rewire the end of the if region to go to the merge block
             BranchInst *IfEndBI = dyn_cast<BranchInst>(IfEnd->getTerminator());
-            assert(IfEndBI);
-            assert(IfEndBI->isUnconditional());
+            if (!IfEndBI || !IfEndBI->isUnconditional())
+                continue;
             IfEndBI->setSuccessor(0, MergeBlock);
 
             // fix phi nodes in the ElseBIBB (which is the block where the else
@@ -269,7 +289,10 @@ namespace {
                     // skip the phi node used for the else branch
                     if (user == ElseBI) continue;
                     PHINode *userPHI = dyn_cast<PHINode>(user);
-                    assert(userPHI);
+                    if (!userPHI) {
+                        toMove.insert(&phi);
+                        continue;
+                    }
                     // if the value is used in the Else side, use the value of the
                     // phi node coming from the header
                     if (DT->dominates(ElseBlock, userPHI->getParent()) && PDT->dominates(ElseEnd, userPHI->getParent())) {
@@ -297,17 +320,19 @@ namespace {
             // fix the phinodes in the MergeBlock
             for (PHINode &phi : MergeBlock->phis()) {
                 Value *val = phi.getIncomingValueForBlock(FlowBB);
-                assert(val);
+                if (!val)
+                    continue;
                 phi.addIncoming(val, IfEnd);
                 phi.removeIncomingValue(FlowBB);
             }
 
             // move the phi nodes outside the Flow Block, to the merge point
-            Instruction *insertionPoint = &*MergeBlock->getInstList().begin();
+            Instruction *insertionPoint = &*MergeBlock->begin();
             for (PHINode *phi: toMove) {
                 phi->moveBefore(insertionPoint);
                 Value *val = phi->getIncomingValueForBlock(IfHeader);
-                assert(val);
+                if (!val)
+                    continue;
                 phi->addIncoming(val, ElseEnd);
                 phi->removeIncomingValue(IfHeader);
             }
@@ -342,4 +367,4 @@ namespace {
 }
 
 char BranchEnhancePass::ID = 0;
-RegisterPass<BranchEnhancePass> MP("branch-enhance", "Loop Enhance Pass");
+RegisterPass<BranchEnhancePass> MP("psr-branch-enhance", "Loop Enhance Pass");

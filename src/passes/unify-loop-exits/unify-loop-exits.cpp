@@ -20,9 +20,11 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/IR/ValueHandle.h"
 
 #define DEBUG_TYPE "unify-loop-exits"
 
@@ -66,7 +68,7 @@ char UnifyLoopExits::ID = 0;
 using BBPredicates = DenseMap<BasicBlock *, PHINode *>;
 using BBSetVector = SetVector<BasicBlock *>;
 
-Value *invertCondition(Value *Condition) {
+static Value *invertCondition(Value *Condition) {
   // First: Check if it's a constant
   if (Constant *C = dyn_cast<Constant>(Condition))
     return ConstantExpr::getNot(C);
@@ -294,7 +296,7 @@ static void createGuardBlocks(SmallVectorImpl<BasicBlock *> &GuardBlocks,
 // since the condition for the final outgoing block is trivially
 // true. So we create one less block (including the first guard block)
 // than the number of outgoing blocks.
-BasicBlock *CreateControlFlowHub(
+static BasicBlock *CreateControlFlowHub(
     DomTreeUpdater *DTU, SmallVectorImpl<BasicBlock *> &GuardBlocks,
     const BBSetVector &Incoming, const BBSetVector &Outgoing,
     const StringRef Prefix) {
@@ -510,4 +512,4 @@ bool UnifyLoopExits::runOnFunction(Function &F) {
   return Changed;
 }
 
-RegisterPass<UnifyLoopExits> MP("unify-loop-exits", "UnifyLoopExits Pass");
+RegisterPass<UnifyLoopExits> MP("psr-unify-loop-exits", "UnifyLoopExits Pass");

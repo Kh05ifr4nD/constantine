@@ -105,7 +105,7 @@ namespace {
         for (auto &F : M.getFunctionList()) {
             if (F.isDeclaration())
                 continue;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
             functionSet.insert(&F);
@@ -128,4 +128,4 @@ namespace {
 }
 
 char InsertComparesPass::ID = 0;
-RegisterPass<InsertComparesPass> MP("insert-compares", "Remove Multiple Lifetimes Pass");
+RegisterPass<InsertComparesPass> MP("psr-insert-compares", "Remove Multiple Lifetimes Pass");

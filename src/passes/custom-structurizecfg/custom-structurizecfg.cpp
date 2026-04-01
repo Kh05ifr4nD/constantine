@@ -13,7 +13,6 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/InstructionSimplify.h"
-#include "llvm/Analysis/LegacyDivergenceAnalysis.h"
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/RegionIterator.h"
 #include "llvm/Analysis/RegionPass.h"
@@ -28,6 +27,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Use.h"
@@ -245,7 +245,6 @@ class StructurizeCFG : public RegionPass {
   Function *Func;
   Region *ParentRegion;
 
-  LegacyDivergenceAnalysis *DA;
   DominatorTree *DT;
 
   SmallVector<RegionNode *, 8> Order;
@@ -319,7 +318,6 @@ public:
         SkipUniformRegions(SkipUniformRegions_) {
     if (ForceSkipUniformRegions.getNumOccurrences())
       SkipUniformRegions = ForceSkipUniformRegions.getValue();
-    initializeStructurizeCFGPass(*PassRegistry::getPassRegistry());
   }
 
   bool doInitialization(Region *R, RGPassManager &RGM) override;
@@ -329,8 +327,6 @@ public:
   StringRef getPassName() const override { return "Structurize control flow"; }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    if (SkipUniformRegions)
-      AU.addRequired<LegacyDivergenceAnalysis>();
     AU.addRequiredID(LowerSwitchID);
     AU.addRequired<DominatorTreeWrapperPass>();
 
@@ -342,15 +338,6 @@ public:
 } // end anonymous namespace
 
 char StructurizeCFG::ID = 0;
-
-INITIALIZE_PASS_BEGIN(StructurizeCFG, "custom-structurizecfg", "Structurize the CFG",
-                      false, false)
-INITIALIZE_PASS_DEPENDENCY(LegacyDivergenceAnalysis)
-INITIALIZE_PASS_DEPENDENCY(LowerSwitch)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(RegionInfoPass)
-INITIALIZE_PASS_END(StructurizeCFG, "custom-structurizecfg", "Structurize the CFG",
-                    false, false)
 
 /// Initialize the types and constants used in the pass
 bool StructurizeCFG::doInitialization(Region *R, RGPassManager &RGM) {
@@ -730,7 +717,7 @@ void StructurizeCFG::simplifyAffectedPhis() {
     Q.DT = DT;
     for (WeakVH VH : AffectedPhis) {
       if (auto Phi = dyn_cast_or_null<PHINode>(VH)) {
-        if (auto NewValue = SimplifyInstruction(Phi, Q)) {
+        if (auto NewValue = simplifyInstruction(Phi, Q)) {
           Phi->replaceAllUsesWith(NewValue);
           Phi->eraseFromParent();
           Changed = true;
@@ -750,8 +737,6 @@ void StructurizeCFG::killTerminator(BasicBlock *BB) {
       SI != SE; ++SI)
     delPhiValues(BB, *SI);
 
-  if (DA)
-    DA->removeValue(Term);
   Term->eraseFromParent();
 }
 
@@ -1074,8 +1059,7 @@ void StructurizeCFG::rebuildSSA() {
     }
 }
 
-static bool hasOnlyUniformBranches(Region *R, unsigned UniformMDKindID,
-                                  const LegacyDivergenceAnalysis &DA) {
+static bool hasOnlyUniformBranches(Region *R, unsigned UniformMDKindID) {
   // Bool for if all sub-regions are uniform.
   bool SubRegionsAreUniform = true;
   // Count of how many direct children are conditional.
@@ -1087,7 +1071,7 @@ static bool hasOnlyUniformBranches(Region *R, unsigned UniformMDKindID,
       if (!Br || !Br->isConditional())
         continue;
 
-      if (!DA.isUniform(Br))
+      if (!Br->getMetadata(UniformMDKindID))
         return false;
 
       // One of our direct children is conditional.
@@ -1137,8 +1121,6 @@ bool StructurizeCFG::runOnRegion(Region *R, RGPassManager &RGM) {
     return false;
 
   dprint("-------------- runOnRegion: " << R->getNameStr() << " --------------");
-  DA = nullptr;
-
   if (SkipUniformRegions) {
     // TODO: We could probably be smarter here with how we handle sub-regions.
     // We currently rely on the fact that metadata is set by earlier invocations
@@ -1146,9 +1128,7 @@ bool StructurizeCFG::runOnRegion(Region *R, RGPassManager &RGM) {
     // but we shouldn't rely on metadata for correctness!
     unsigned UniformMDKindID =
         R->getEntry()->getContext().getMDKindID("custom-structurizecfg.uniform");
-    DA = &getAnalysis<LegacyDivergenceAnalysis>();
-
-    if (hasOnlyUniformBranches(R, UniformMDKindID, *DA)) {
+    if (hasOnlyUniformBranches(R, UniformMDKindID)) {
       LLVM_DEBUG(dbgs() << "Skipping region with uniform control flow: " << *R
                         << '\n');
 
@@ -1197,4 +1177,4 @@ bool StructurizeCFG::runOnRegion(Region *R, RGPassManager &RGM) {
   return true;
 }
 
-RegisterPass<StructurizeCFG> MP("custom-structurizecfg", "custom StructurizeCFG Pass");
+RegisterPass<StructurizeCFG> MP("psr-custom-structurizecfg", "custom StructurizeCFG Pass");

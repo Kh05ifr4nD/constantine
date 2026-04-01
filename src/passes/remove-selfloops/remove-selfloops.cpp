@@ -6,6 +6,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -145,7 +146,7 @@ namespace {
         for (auto &F : M.getFunctionList()) {
             if (F.isDeclaration())
                 continue;
-            const std::string &FName = F.getName();
+            const std::string FName = F.getName().str();
             if (!passListRegexMatch(FunctionRegexes, FName))
                 continue;
             functionSet.insert(&F);
@@ -167,4 +168,4 @@ namespace {
 }
 
 char RemoveSelfloopsPass::ID = 0;
-RegisterPass<RemoveSelfloopsPass> MP("remove-selfloops", "Remove Selfloops Pass");
+RegisterPass<RemoveSelfloopsPass> MP("psr-remove-selfloops", "Remove Selfloops Pass");
