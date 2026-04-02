@@ -68,6 +68,16 @@ char UnifyLoopExits::ID = 0;
 using BBPredicates = DenseMap<BasicBlock *, PHINode *>;
 using BBSetVector = SetVector<BasicBlock *>;
 
+static bool isRedirectableToHub(BasicBlock *BB, const BBSetVector &Outgoing) {
+  auto *Branch = dyn_cast_or_null<BranchInst>(BB ? BB->getTerminator() : nullptr);
+  if (!Branch)
+    return false;
+  if (Branch->isUnconditional())
+    return Outgoing.count(Branch->getSuccessor(0));
+  return Outgoing.count(Branch->getSuccessor(0)) ||
+         Outgoing.count(Branch->getSuccessor(1));
+}
+
 static Value *invertCondition(Value *Condition) {
   // First: Check if it's a constant
   if (Constant *C = dyn_cast<Constant>(Condition))
@@ -84,7 +94,8 @@ static Value *invertCondition(Value *Condition) {
     Parent = Inst->getParent();
   else if (Argument *Arg = dyn_cast<Argument>(Condition))
     Parent = &Arg->getParent()->getEntryBlock();
-  assert(Parent && "Unsupported condition to invert");
+  if (!Parent)
+    return Condition;
 
   // Third: Check all the users for an invert
   for (User *U : Condition->users())
@@ -129,7 +140,6 @@ static void reconnectPhis(BasicBlock *Out, BasicBlock *GuardBlock,
       }
       NewPhi->addIncoming(V, In);
     }
-    assert(NewPhi->getNumIncomingValues() == Incoming.size());
     if (Phi->getNumOperands() == 0) {
       Phi->replaceAllUsesWith(NewPhi);
       I = Phi->eraseFromParent();
@@ -153,7 +163,9 @@ static void reconnectPhis(BasicBlock *Out, BasicBlock *GuardBlock,
 static std::tuple<Value *, BasicBlock *, BasicBlock *>
 redirectToHub(BasicBlock *BB, BasicBlock *FirstGuardBlock,
               const BBSetVector &Outgoing) {
-  auto Branch = cast<BranchInst>(BB->getTerminator());
+  auto *Branch = dyn_cast<BranchInst>(BB->getTerminator());
+  if (!Branch)
+    return std::make_tuple(nullptr, nullptr, nullptr);
   auto Condition = Branch->isConditional() ? Branch->getCondition() : nullptr;
 
   BasicBlock *Succ0 = Branch->getSuccessor(0);
@@ -161,12 +173,14 @@ redirectToHub(BasicBlock *BB, BasicBlock *FirstGuardBlock,
   Succ0 = Outgoing.count(Succ0) ? Succ0 : nullptr;
 
   if (Branch->isUnconditional()) {
+    if (!Succ0)
+      return std::make_tuple(Condition, nullptr, nullptr);
     Branch->setSuccessor(0, FirstGuardBlock);
-    assert(Succ0);
   } else {
     Succ1 = Branch->getSuccessor(1);
     Succ1 = Outgoing.count(Succ1) ? Succ1 : nullptr;
-    assert(Succ0 || Succ1);
+    if (!Succ0 && !Succ1)
+      return std::make_tuple(Condition, nullptr, nullptr);
     if (Succ0 && !Succ1) {
       Branch->setSuccessor(0, FirstGuardBlock);
     } else if (Succ1 && !Succ0) {
@@ -177,7 +191,6 @@ redirectToHub(BasicBlock *BB, BasicBlock *FirstGuardBlock,
     }
   }
 
-  assert(Succ0 || Succ1);
   return std::make_tuple(Condition, Succ0, Succ1);
 }
 
@@ -217,6 +230,8 @@ static void convertToGuardPredicates(
     BasicBlock *Succ1;
     std::tie(Condition, Succ0, Succ1) =
         redirectToHub(In, FirstGuardBlock, Outgoing);
+    if (!Succ0 && !Succ1)
+      continue;
 
     // Optimization: Consider an incoming block A with both successors
     // Succ0 and Succ1 in the set of outgoing blocks. The predicates
@@ -239,7 +254,6 @@ static void convertToGuardPredicates(
         Phi->addIncoming(BoolTrue, In);
         continue;
       }
-      assert(Succ0 && Succ1);
       OneSuccessorDone = true;
       if (Out == Succ0) {
         Phi->addIncoming(Condition, In);
@@ -269,7 +283,8 @@ static void createGuardBlocks(SmallVectorImpl<BasicBlock *> &GuardBlocks,
     GuardBlocks.push_back(
         BasicBlock::Create(F->getContext(), Prefix + ".guard", F));
   }
-  assert(GuardBlocks.size() == GuardPredicates.size());
+  if (GuardBlocks.size() != GuardPredicates.size())
+    return;
 
   // To help keep the loop simple, temporarily append the last
   // outgoing block to the list of guard blocks.
@@ -277,8 +292,10 @@ static void createGuardBlocks(SmallVectorImpl<BasicBlock *> &GuardBlocks,
 
   for (int i = 0, e = GuardBlocks.size() - 1; i != e; ++i) {
     auto Out = Outgoing[i];
-    assert(GuardPredicates.count(Out));
-    BranchInst::Create(Out, GuardBlocks[i + 1], GuardPredicates[Out],
+    auto It = GuardPredicates.find(Out);
+    if (It == GuardPredicates.end())
+      return;
+    BranchInst::Create(Out, GuardBlocks[i + 1], It->second,
                        GuardBlocks[i]);
   }
 
@@ -300,6 +317,12 @@ static BasicBlock *CreateControlFlowHub(
     DomTreeUpdater *DTU, SmallVectorImpl<BasicBlock *> &GuardBlocks,
     const BBSetVector &Incoming, const BBSetVector &Outgoing,
     const StringRef Prefix) {
+  if (Incoming.empty() || Outgoing.size() < 2)
+    return nullptr;
+  for (auto *In : Incoming) {
+    if (!isRedirectableToHub(In, Outgoing))
+      return nullptr;
+  }
   auto F = Incoming.front()->getParent();
   auto FirstGuardBlock =
       BasicBlock::Create(F->getContext(), Prefix + ".guard", F);
@@ -322,6 +345,8 @@ static BasicBlock *CreateControlFlowHub(
 
   GuardBlocks.push_back(FirstGuardBlock);
   createGuardBlocks(GuardBlocks, F, Outgoing, GuardPredicates, Prefix);
+  if (GuardBlocks.empty())
+    return nullptr;
 
   // Update the PHINodes in each outgoing block to match the new control flow.
   for (int i = 0, e = GuardBlocks.size(); i != e; ++i) {
@@ -331,7 +356,8 @@ static BasicBlock *CreateControlFlowHub(
 
   if (DTU) {
     int NumGuards = GuardBlocks.size();
-    assert((int)Outgoing.size() == NumGuards + 1);
+    if (static_cast<int>(Outgoing.size()) != NumGuards + 1)
+      return nullptr;
     for (int i = 0; i != NumGuards - 1; ++i) {
       Updates.push_back({DominatorTree::Insert, GuardBlocks[i], Outgoing[i]});
       Updates.push_back(
@@ -470,14 +496,10 @@ static bool unifyLoopExits(DominatorTree &DT, LoopInfo &LI, Loop *L) {
   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Eager);
   auto LoopExitBlock = CreateControlFlowHub(&DTU, GuardBlocks, ExitingBlocks,
                                             Exits, "loop.exit");
+  if (!LoopExitBlock)
+    return false;
 
   restoreSSA(DT, L, ExitingBlocks, LoopExitBlock);
-
-#if defined(EXPENSIVE_CHECKS)
-  assert(DT.verify(DominatorTree::VerificationLevel::Full));
-#else
-  assert(DT.verify(DominatorTree::VerificationLevel::Fast));
-#endif // EXPENSIVE_CHECKS
   L->verifyLoop();
 
   // The guard blocks were created outside the loop, so they need to become

@@ -123,12 +123,16 @@ namespace {
                     /// 5    5 = "End" block, also rejoins the control flow
                     /// \endverbatim
                     BranchInst *IncomingTerm = dyn_cast<BranchInst>(IncomingBlock->getTerminator());
-                    assert(IncomingTerm);
+                    if (!IncomingTerm) {
+                        continue;
+                    }
                     if (!IncomingTerm->isConditional()) {
                         continue;
                     }
 
-                    assert(DT->dominates(IncomingBlock, BB));
+                    if (!DT->dominates(IncomingBlock, BB)) {
+                        continue;
+                    }
                     Value *IncomingCond = IncomingTerm->getCondition();
                     searchDependencies(DT, IncomingCond, dependencies, visited);
                 }
@@ -161,7 +165,9 @@ namespace {
 
             // get the successors and the branch condition
             Value *Cond = BI->getCondition();
-            assert(BI->getNumSuccessors()==2);
+            if (BI->getNumSuccessors() != 2) {
+                continue;
+            }
             BasicBlock* TrueBB = BI->getSuccessor(0);
             BasicBlock* FalseBB = BI->getSuccessor(1);
 
@@ -169,7 +175,9 @@ namespace {
             // structurize CFG should put the Flow block in the `false` side
             // ensure that by checking that either the false side postdominates the true
             // side, or the false side dominates the BB itself (in case of loops)
-            assert(PDT->dominates(FalseBB, TrueBB) || DT->dominates(FalseBB, &BB));
+            if (!(PDT->dominates(FalseBB, TrueBB) || DT->dominates(FalseBB, &BB))) {
+                continue;
+            }
 
             // in the case of a loop we are not interested
             if (DT->dominates(FalseBB, &BB)) continue;

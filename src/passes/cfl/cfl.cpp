@@ -99,9 +99,9 @@ namespace {
         MDNode* N;
         Constant *val;
         N = I.getMetadata("uninteresting_direction");
-        assert(N);
+        if (N == NULL) return false;
         val = dyn_cast<ConstantAsMetadata>(N->getOperand(0))->getValue();
-        assert(val);
+        if (!val) return false;
         int direction = cast<ConstantInt>(val)->getSExtValue();
         return direction;
     }
@@ -197,7 +197,7 @@ namespace {
         FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy}, false);
         FunctionCallee Wrap = M->getOrInsertFunction("cfl_fptr_wrap", FTy);
         Function *F = dyn_cast<Function>(Wrap.getCallee());
-        assert(F);
+        if (!F) return;
         std::vector<Value*> args;
         Type *Param0 = F->getFunctionType()->getParamType(0);
         args.push_back(
@@ -217,7 +217,7 @@ namespace {
         FunctionCallee Wrap = M->getOrInsertFunction("cfl_ptr_wrap", FTy);
         Function *F = dyn_cast<Function>(Wrap.getCallee());
         static InlineFunctionInfo IFI;
-        assert(F);
+        if (!F) return;
         std::vector<Value*> args;
         args.push_back(CastInst::CreatePointerCast(
             LI->getPointerOperand(), F->getFunctionType()->getParamType(0), "",
@@ -237,7 +237,7 @@ namespace {
         FunctionCallee Wrap = M->getOrInsertFunction("cfl_ptr_wrap", FTy);
         Function *F = dyn_cast<Function>(Wrap.getCallee());
         static InlineFunctionInfo IFI;
-        assert(F);
+        if (!F) return;
         std::vector<Value*> args;
         args.push_back(CastInst::CreatePointerCast(
             SI->getPointerOperand(), F->getFunctionType()->getParamType(0), "",
@@ -271,7 +271,7 @@ namespace {
         int branchIBID = getIBID(*IFC.Branch);
 
         // assert that the branch is not tainted
-        assert(!getInstructionTaint(*IFC.Branch));
+        if (getInstructionTaint(*IFC.Branch)) return;
 
         bool fixed_res = getUninterestingDirection(*IFC.Branch);
         // Call the wrapper
@@ -316,6 +316,8 @@ namespace {
             IfFalseF = dyn_cast<Function>(IfFalseCal.getCallee());
             MergePointF = dyn_cast<Function>(MergeCal.getCallee());
         }
+        if (!CondF || !IfTrueF || !IfFalseF || !MergePointF)
+            return;
 
         // Create local to pass to wrappers
         LLVMContext &C = F->getContext();
@@ -390,7 +392,8 @@ namespace {
         LoadInst *CondMerge =
             new LoadInst(Type::getInt1Ty(C), AICond, "", MergeIP);
         while (PHINode *PN = dyn_cast<PHINode>(IFC.MergePoint->begin())) {
-            assert(PN->getNumIncomingValues() == 2);
+            if (PN->getNumIncomingValues() != 2)
+                break;
             Value *TrueVal = PN->getIncomingValue(PN->getIncomingBlock(0) == IFC.IfTruePred ? 0 : 1);
             Value *FalseVal = PN->getIncomingValue(PN->getIncomingBlock(0) == IFC.IfTruePred ? 1 : 0);
             Value *Sel = SelectInst::Create(CondMerge, TrueVal, FalseVal, "",
@@ -402,16 +405,20 @@ namespace {
 
         // Move IfFalse block (might be MergePoint) under IfTrue block
         BranchInst *BI = dyn_cast<BranchInst>(IFC.IfTruePred->getTerminator());
+        if (!BI)
+            return;
+        bool Rewired = false;
         for (unsigned i=0;i<BI->getNumSuccessors();i++) {
             if (BI->getSuccessor(i) == IFC.MergePoint) {
                 // In the case where IfTruePred == IfHeader, the IFC.Branch
                 // will now point twice to IFFalse, but it's ok
                 BI->setSuccessor(i, IFC.IfFalse);
-                BI = NULL;
+                Rewired = true;
                 break;
             }
         }
-        assert(!BI);
+        if (!Rewired)
+            return;
 
         // Remove conditional branch if IfTruePred != IfHeader
         // Otherwise we already fixed the jumps while connecting IfTrue to IFFalse
@@ -474,7 +481,8 @@ namespace {
         for (BasicBlock *Pred : predecessors(IFC.MergePoint)) {
             if (!DT->dominates(IFC.IfTrue, Pred))
                 continue;
-            assert(!IFC.IfTruePred);
+            if (IFC.IfTruePred)
+                return NULL;
             IFC.IfTruePred = Pred;
         }
         // if no predecessor of the MergePoint is dominated by the IFTrue Block

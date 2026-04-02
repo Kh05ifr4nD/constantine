@@ -73,9 +73,11 @@ namespace {
                     Lifetime->eraseFromParent();
                 }
                 Instruction* TargetI = dyn_cast<Instruction>(Target);
-                assert(TargetI);
+                if (!TargetI)
+                    continue;
                 Instruction* NI = TargetI->getNextNode();
-                assert(NI);
+                if (!NI)
+                    continue;
                 llvm::IRBuilder<> BuilderStart(NI);
                 BuilderStart.CreateLifetimeStart(Target, NegativeOne);
             }

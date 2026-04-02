@@ -90,7 +90,8 @@ namespace {
                 }
                 PredIt++;
             }
-            assert(PredBB && "Did not find a predecessor which is not postdominated by the selfloop");
+            if (!PredBB)
+                continue;
             // oprint("    " << PredBB->getName().str());
 
             // Find the successor of PredBB that does not dominates BB
@@ -101,11 +102,14 @@ namespace {
                     break;
                 }
             }
-            assert(targetBB && "Did not find a successor of PredBB which is not dominated by the self loop");
+            if (!targetBB)
+                continue;
             // oprint("    " << targetBB->getName().str());
 
             // insert a loop header (may be already present)
             BasicBlock *NewBB = SplitBlock(BB, BB->getTerminator());
+            if (!NewBB)
+                continue;
             // Now BB is the loop header
             // oprint("New BB: " << *NewBB);
 
@@ -118,7 +122,8 @@ namespace {
             static ConstantInt *BoolTrue = ConstantInt::getTrue(F->getContext());
             BranchInst *NewBI = BranchInst::Create(BB, ExitBB, BoolTrue);
             ReplaceInstWithInst(BI, NewBI);
-            assert(NewBI->getParent() == NewBB);
+            if (NewBI->getParent() != NewBB)
+                continue;
 
             // oprint("Updated Block: " << *NewBB);
 

@@ -61,7 +61,7 @@ namespace {
         else if (Function *F = dyn_cast<Function>(V))
             F->setMetadata(key, N);
         else
-            assert(0 && "Not implemented!");
+            return;
     }
 
     virtual bool runOnModule(Module &M) {

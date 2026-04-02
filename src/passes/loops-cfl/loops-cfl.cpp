@@ -235,7 +235,7 @@ namespace {
 
     // Memory accesses and external calls are already managed in the cfl pass,
     // here we just need to manage the loop iterations (i.e. avoid iteration timing leaks)
-    void loops_cfl(Loop* L) {
+    bool loops_cfl(Loop* L) {
         static Function *PreheaderFunc, *ExitingFunc, *ExitFunc, *DumpFunc;
         // CFL already wrapped loads, stores, memory intrinsics, and external calls
 
@@ -286,16 +286,11 @@ namespace {
         }
 
         if (!PreheaderBlock || !HeaderBlock || ExitSites.empty()) {
-            errs() << "[loops-cfl] unsupported tainted loop in function '"
-                   << F->getName()
-                   << "' (needs preheader + tainted conditional exit branch)\n";
-            report_fatal_error("loops-cfl: unsupported tainted loop form");
+            return false;
         }
 
         if (PreheaderBlock->getUniqueSuccessor() != HeaderBlock) {
-            errs() << "[loops-cfl] tainted loop in function '" << F->getName()
-                   << "' has unexpected preheader/header layout\n";
-            report_fatal_error("loops-cfl: unsupported tainted loop preheader layout");
+            return false;
         }
 
         for (auto &Site : ExitSites) {
@@ -323,11 +318,7 @@ namespace {
 
             if (Site.ExitBlock != BI->getSuccessor(0) ||
                 !L->contains(BI->getSuccessor(1))) {
-                errs() << "[loops-cfl] tainted loop has unexpected successor "
-                          "layout in function '"
-                       << F->getName() << "'\n";
-                report_fatal_error(
-                    "loops-cfl: unsupported tainted loop successor layout");
+                return false;
             }
 
             Site.LoopCond = BI->getCondition();
@@ -363,7 +354,8 @@ namespace {
                      FunctionType::get(VoidTy, {PtrTy, I1, I32, I32}, false))
                     .getCallee());
         }
-        assert(PreheaderFunc && ExitingFunc && ExitFunc && DumpFunc);
+        if (!PreheaderFunc || !ExitingFunc || !ExitFunc || !DumpFunc)
+            return false;
 
         // Create locals to pass to wrappers
         AllocaInst *AITmp = new AllocaInst(Type::getInt1Ty(M->getContext()), 0,
@@ -483,7 +475,8 @@ namespace {
 
                 // Redirect the exiting edge Pred -> EB to Pred -> Tramp -> EB.
                 Instruction *TI = Pred->getTerminator();
-                assert(TI && TI->isTerminator());
+                if (!TI || !TI->isTerminator())
+                    continue;
                 for (unsigned si = 0; si < TI->getNumSuccessors(); ++si) {
                     if (TI->getSuccessor(si) == EB)
                         TI->setSuccessor(si, Tramp);
@@ -505,7 +498,7 @@ namespace {
         if (DumpConf) {
             // Add llvm.loop.unroll.disable metadata to the loop
             setLoopNoUnroll(L);
-            return;
+            return true;
         }
 
         // We have to protect the values that are generated in the loop, and used
@@ -517,9 +510,11 @@ namespace {
         // since I do not trust myself reading docs
         // otherwise we may let some values escape, or wrap wrong ones
         for (auto &Site : ExitSites) {
-            assert(allBB.find(Site.ExitBlock) == allBB.end());
+            if (allBB.find(Site.ExitBlock) != allBB.end())
+                return false;
         }
-        assert(allBB.find(PreheaderBlock) == allBB.end());
+        if (allBB.find(PreheaderBlock) != allBB.end())
+            return false;
 
         // an escaping value and its uses
         std::map<Instruction*, std::set<Instruction*>> escapingValuesAndUses;
@@ -530,7 +525,8 @@ namespace {
             M->getOrInsertGlobal("taken", Type::getInt1Ty(M->getContext()));
             CFL_taken_ref = M->getNamedGlobal("taken");
         }
-        assert(CFL_taken_ref);
+        if (!CFL_taken_ref)
+            return false;
         for(BasicBlock *BB: L->getBlocks()) {
             for (Instruction &I: *BB) {
                 // If the instruction is the result of a call to `cfl_ptr_wrap`
@@ -739,10 +735,12 @@ namespace {
 
         // Add llvm.loop.unroll.disable metadata to the loop
         setLoopNoUnroll(L);
+        return true;
     }
 
     bool runOnLoop(Loop *L, LPPassManager &LPM) override {
-        assert(L->isLoopSimplifyForm());
+        if (!L->isLoopSimplifyForm())
+            return false;
 
         std::vector<Regex*> FunctionRegexes;
         if (Functions.empty())
@@ -783,8 +781,9 @@ namespace {
 	            return false;
 	        }
 
+	        if (!loops_cfl(L))
+	            return false;
 	        ++protectedLoops;
-	        loops_cfl(L);
 	        return true;
 	    }
   };

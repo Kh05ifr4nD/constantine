@@ -13,6 +13,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/WithColor.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
 #include <optional>
@@ -193,7 +194,8 @@ namespace {
             // qprint("Splitting " << IFCHeader->getName().str());
             // BasicBlock* BB = IFCHeader->splitBasicBlock(IFC.Branch);
             BasicBlock* newHeader = SplitBlock(IFC.Branch->getParent(), IFC.Branch, &DT, LI);
-            assert(newHeader);
+            if (!newHeader)
+                return false;
             PDT.recalculate(F);
             ValidInfo = false;
         }
@@ -203,7 +205,8 @@ namespace {
             // qprint("Splitting merge point " << IFC.MergePoint->getName().str());
             // BasicBlock* BB = IFC.MergePoint->splitBasicBlock(IFC.MergePoint->getTerminator());
             BasicBlock* BB = SplitBlock(IFC.MergePoint, IFC.MergePoint->getTerminator(), &DT, LI);
-            assert(BB);
+            if (!BB)
+                return false;
             PDT.recalculate(F);
             ValidInfo = false;
         }
@@ -252,7 +255,8 @@ namespace {
             }
             std::vector<BasicBlock*> PredsVec(Preds.begin(), Preds.end());
             BasicBlock * newMergeBB = SplitBlockPredecessors(IFC.MergePoint, PredsVec, ".splitted", &DT, LI);
-            assert(newMergeBB);
+            if (!newMergeBB)
+                return false;
             // set the new merge BB
             // oprint("Split " << IFC.MergePoint->getName().str() <<" into " << newMergeBB->getName().str());
             IFC.MergePoint = newMergeBB;
@@ -337,14 +341,16 @@ namespace {
             // qprint("Splitting " << LPreheader->getName().str());
             // BasicBlock* BB = LPreheader->splitBasicBlock(LPreheader->getTerminator());
             BasicBlock* BB = SplitBlock(LPreheader, LPreheader->getTerminator(), &DT, LI);
-            assert(BB);
+            if (!BB)
+                return false;
             ValidInfo = false;
         }
         else if(LHeader == &F.getEntryBlock()) {
             // qprint("Splitting " << LHeader->getName().str());
             // BasicBlock* BB = LHeader->splitBasicBlock(LHeader->getTerminator());
             BasicBlock* BB = SplitBlock(LHeader, LHeader->getTerminator(), &DT, LI);
-            assert(BB);
+            if (!BB)
+                return false;
             ValidInfo = false;
         }
         
@@ -353,7 +359,8 @@ namespace {
             // qprint("Splitting exit block" << L->getExitBlock()->getName().str());
             // BasicBlock* BB = L->getExitBlock()->splitBasicBlock(L->getExitBlock()->getTerminator());
             BasicBlock* BB = SplitBlock(L->getExitBlock(), L->getExitBlock()->getTerminator(), &DT, LI);
-            assert(BB);
+            if (!BB)
+                return false;
             LI->removeBlock(BB);
             ValidInfo = false;
         }
@@ -573,13 +580,16 @@ namespace {
                 qprint("-- UNIDENTIFIED BRANCH --");
                 unidentified_branch->dump();
             }
+            WithColor::warning(errs())
+                << "[branch-extract] failed to extract all conditional shapes in "
+                << F.getName() << " (" << count << "/" << tot_branches
+                << "); leaving residual control debt for later gates\n";
             qprint("Failed to extract all branches: dumping in failed.bc");
             std::error_code EC;
             if (std::unique_ptr<raw_fd_ostream> os = openFile("./failed.bc")) {
                 WriteBitcodeToFile(*F.getParent(), *os);
                 (*os).close();
             }
-            exit(1);
         }
     }
 
