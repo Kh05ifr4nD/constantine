@@ -86,6 +86,13 @@ namespace {
         return taint;
     }
 
+    void copyAtfieldSiteMetadata(Instruction *Dst, Instruction *Src) {
+        if (!Dst || !Src)
+            return;
+        if (MDNode *N = Src->getMetadata("atfield.site"))
+            Dst->setMetadata("atfield.site", N);
+    }
+
     // check if the instruction has been marked as uninteresting by the 
     // loadtainted pass
     bool isInstructionUninteresting(Instruction &I) {
@@ -357,7 +364,9 @@ namespace {
             CondFArgs.push_back(makeConstI32(C, branchBGID));
             CondFArgs.push_back(makeConstI32(C, branchIBID));
         }
-        CallInst::Create(CondF, CondFArgs, "", IfHeader->getTerminator());
+        CallInst *CondCall =
+            CallInst::Create(CondF, CondFArgs, "", IfHeader->getTerminator());
+        copyAtfieldSiteMetadata(CondCall, IFC.Branch);
 
         if (IFC.IfTrue != IFC.MergePoint) {
             std::vector<Value*> IfTrueFArgs;
@@ -366,7 +375,9 @@ namespace {
             LoadInst *CondTrue =
                 new LoadInst(Type::getInt1Ty(C), AICond, "", IfTrueIP);
             IfTrueFArgs.push_back(CondTrue);
-            CallInst::Create(IfTrueF, IfTrueFArgs, "", IfTrueIP);
+            CallInst *IfTrueCall =
+                CallInst::Create(IfTrueF, IfTrueFArgs, "", IfTrueIP);
+            copyAtfieldSiteMetadata(IfTrueCall, IFC.Branch);
         }
 
         if (IFC.IfFalse != IFC.MergePoint) {
@@ -376,12 +387,15 @@ namespace {
             LoadInst *CondFalse =
                 new LoadInst(Type::getInt1Ty(C), AICond, "", IfFalseIP);
             IfFalseFArgs.push_back(CondFalse);
-            CallInst::Create(IfFalseF, IfFalseFArgs, "", IfFalseIP);
+            CallInst *IfFalseCall =
+                CallInst::Create(IfFalseF, IfFalseFArgs, "", IfFalseIP);
+            copyAtfieldSiteMetadata(IfFalseCall, IFC.Branch);
         }
 
         std::vector<Value*> MergePointFArgs;
         MergePointFArgs.push_back(AITmp);
         CallInst* MergeCall = CallInst::Create(MergePointF, MergePointFArgs, "", &*(IFC.MergePoint->getFirstInsertionPt()));
+        copyAtfieldSiteMetadata(MergeCall, IFC.Branch);
 
         // Create lifetime end at the merge point
         llvm::IRBuilder<> BuilderEnd(MergeCall->getNextNode());

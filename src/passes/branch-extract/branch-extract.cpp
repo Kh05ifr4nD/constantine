@@ -187,6 +187,13 @@ namespace {
         I.setMetadata("t", N);
     }
 
+    void copyAtfieldSiteMetadata(Instruction *Dst, Instruction *Src) {
+        if (!Dst || !Src)
+            return;
+        if (MDNode *N = Src->getMetadata("atfield.site"))
+            Dst->setMetadata("atfield.site", N);
+    }
+
     bool doExtract(Function &F, IfCondition &IFC, DominatorTree &DT, PostDominatorTree &PDT, LoopInfo *LI, const char* name) {
         // If the branch is owned by the function header we should split it
         // oprint("\ntrying branch: " << IFC.Branch->getParent()->getName().str() << " => " << IFC.MergePoint->getName().str());
@@ -310,6 +317,7 @@ namespace {
             AC = ACT->lookupAssumptionCache(F);
         }
 
+        MDNode *OriginalAtfieldSite = IFC.Branch->getMetadata("atfield.site");
         CodeExtractor Extractor(BasicBlocks, &DT, false, nullptr, nullptr, AC);
         CodeExtractorAnalysisCache CEAC(F);
 
@@ -323,6 +331,15 @@ namespace {
             // inherit the attribute, so remove it
             if(extractedFunc->hasFnAttribute(Attribute::NoInline))
                 extractedFunc->removeFnAttr(Attribute::NoInline);
+            if (OriginalAtfieldSite) {
+                for (BasicBlock &ExtractedBB : *extractedFunc) {
+                    Instruction *Term = ExtractedBB.getTerminator();
+                    if (!Term)
+                        continue;
+                    if (isa<BranchInst>(Term) || isa<SwitchInst>(Term))
+                        Term->setMetadata("atfield.site", OriginalAtfieldSite);
+                }
+            }
             for(BasicBlock *BB: BasicBlocks) {
                 LI->removeBlock(BB);
             }

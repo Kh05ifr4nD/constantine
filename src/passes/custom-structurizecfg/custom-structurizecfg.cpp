@@ -271,6 +271,8 @@ class StructurizeCFG : public RegionPass {
 
   Value *buildCondition(BranchInst *Term, unsigned Idx, bool Invert);
 
+  void copyAtfieldSiteMetadata(Instruction *Dst, Instruction *Src);
+
   void gatherPredicates(RegionNode *N);
 
   void collectInfos();
@@ -469,16 +471,34 @@ Value *StructurizeCFG::invertCondition(Value *Condition) {
   return Inverted;
 }
 
+void StructurizeCFG::copyAtfieldSiteMetadata(Instruction *Dst,
+                                             Instruction *Src) {
+  if (!Dst || !Src)
+    return;
+  if (MDNode *N = Src->getMetadata("atfield.site"))
+    Dst->setMetadata("atfield.site", N);
+}
+
+static MDNode *getAtfieldSiteMetadata(Value *V) {
+  if (Instruction *I = dyn_cast_or_null<Instruction>(V))
+    return I->getMetadata("atfield.site");
+  return nullptr;
+}
+
 /// Build the condition for one edge
 Value *StructurizeCFG::buildCondition(BranchInst *Term, unsigned Idx,
                                       bool Invert) {
   Value *Cond = Invert ? BoolFalse : BoolTrue;
   if (Term->isConditional()) {
     Cond = Term->getCondition();
+    if (Instruction *CondI = dyn_cast_or_null<Instruction>(Cond))
+      copyAtfieldSiteMetadata(CondI, Term);
 
     if (Idx != (unsigned)Invert) {
       dprint("Inverting condition: " << *Cond);
       Cond = invertCondition(Cond);
+      if (Instruction *CondI = dyn_cast_or_null<Instruction>(Cond))
+        copyAtfieldSiteMetadata(CondI, Term);
       dprint(" to :" << *Cond);
     }
   }
@@ -617,9 +637,12 @@ void StructurizeCFG::insertConditions(bool Loops) {
     }
 
     Value *ParentValue = nullptr;
+    MDNode *AtfieldSite = nullptr;
     for (std::pair<BasicBlock *, Value *> BBAndPred : Preds) {
       BasicBlock *BB = BBAndPred.first;
       Value *Pred = BBAndPred.second;
+      if (!AtfieldSite)
+        AtfieldSite = getAtfieldSiteMetadata(Pred);
 
       dprint("- BB: " << BB->getName().str());
       // dprint("- BB: " << *BB);
@@ -636,6 +659,8 @@ void StructurizeCFG::insertConditions(bool Loops) {
     if (ParentValue) {
       dprint("A");
       Term->setCondition(ParentValue);
+      if (!AtfieldSite)
+        AtfieldSite = getAtfieldSiteMetadata(ParentValue);
     } else {
       if (!Dominator.resultIsRememberedBlock())
         PhiInserter.AddAvailableValue(Dominator.result(), Default);
@@ -645,7 +670,11 @@ void StructurizeCFG::insertConditions(bool Loops) {
       Value* v = PhiInserter.GetValueInMiddleOfBlock(Parent);
       dprint("val: " << *v);
       Term->setCondition(v);
+      if (!AtfieldSite)
+        AtfieldSite = getAtfieldSiteMetadata(v);
     }
+    if (AtfieldSite)
+      Term->setMetadata("atfield.site", AtfieldSite);
     dprint(" set to:" << *Term);
   }
 }
@@ -746,7 +775,12 @@ void StructurizeCFG::killTerminator(BasicBlock *BB) {
       SI != SE; ++SI)
     delPhiValues(BB, *SI);
 
+  MDNode *AtfieldSite = Term->getMetadata("atfield.site");
   Term->eraseFromParent();
+  if (AtfieldSite) {
+    if (Instruction *NewTerm = BB->getTerminator())
+      NewTerm->setMetadata("atfield.site", AtfieldSite);
+  }
 }
 
 /// Let node exit(s) point to NewExit
