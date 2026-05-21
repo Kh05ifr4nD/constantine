@@ -3,6 +3,7 @@
 #include <map>
 #include <optional>
 
+#include "llvm/Analysis/Loads.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
@@ -320,6 +321,19 @@ namespace {
         return GV && GV->isConstant();
     }
 
+    void markGeneratedLoadSafety(LoadInst *LI, StringRef Reason) {
+        LLVMContext &C = LI->getContext();
+        LI->setMetadata("atfield.generated_load_safe",
+                        MDNode::get(C, MDString::get(C, Reason)));
+    }
+
+    bool isProvenNonTrappingGeneratedLoad(LoadInst *LI) {
+        Module *M = LI->getFunction()->getParent();
+        const DataLayout &DL = M->getDataLayout();
+        return isDereferenceableAndAlignedPointer(
+            LI->getPointerOperand(), LI->getType(), LI->getAlign(), DL, LI);
+    }
+
     bool shouldWrapGeneratedLoad(LoadInst *LI) {
         Function *F = LI->getFunction();
         if (!isGeneratedControlFunction(F))
@@ -331,6 +345,10 @@ namespace {
             return false;
         if (isConstantGlobalLoad(Ptr))
             return false;
+        if (isProvenNonTrappingGeneratedLoad(LI)) {
+            markGeneratedLoadSafety(LI, "nontrapping_dereferenceable");
+            return false;
+        }
         return true;
     }
 
