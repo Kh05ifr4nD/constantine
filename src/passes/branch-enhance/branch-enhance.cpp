@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <set>
+#include <optional>
 
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
@@ -258,6 +259,26 @@ namespace {
                 }
             }
             if (!IfEnd)
+                continue;
+            auto condValueFor = [](Value *V) -> std::optional<bool> {
+                auto *C = dyn_cast<ConstantInt>(V);
+                if (!C || !C->getType()->isIntegerTy(1))
+                    return std::nullopt;
+                return C->isOne();
+            };
+            bool inverted = false;
+            Value *FlowCond = ElseBI->getCondition();
+            Value *NotCondition = nullptr;
+            if (match(FlowCond, m_Not(m_Value(NotCondition)))) {
+                FlowCond = NotCondition;
+                inverted = true;
+            }
+            PHINode *FlowCondPhi = dyn_cast<PHINode>(FlowCond);
+            if (!FlowCondPhi || FlowCondPhi->getParent() != FlowBB)
+                continue;
+            std::optional<bool> FromHeader = condValueFor(FlowCondPhi->getIncomingValueForBlock(IfHeader));
+            std::optional<bool> FromIfEnd = condValueFor(FlowCondPhi->getIncomingValueForBlock(IfEnd));
+            if (!FromHeader || !FromIfEnd || ((*FromHeader ^ inverted) != true) || ((*FromIfEnd ^ inverted) != false))
                 continue;
 
             // The end of the else region is the predecessor of the merge point

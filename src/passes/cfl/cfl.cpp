@@ -3,6 +3,7 @@
 #include <map>
 #include <optional>
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/CFG.h"
@@ -29,6 +30,21 @@ static cl::opt<bool>
 MemProtect("cfl-protect-mem",
     cl::desc("CFL: protect memory accesses (disable if run after DFL)"),
     cl::init(true), cl::NotHidden);
+
+static cl::list<std::string>
+LoadFunctions("cfl-protect-load-funcs",
+    cl::desc("Restrict CFL load protection to comma-separated function regexes"),
+    cl::ZeroOrMore, cl::CommaSeparated, cl::NotHidden);
+
+static cl::list<std::string>
+StoreFunctions("cfl-protect-store-funcs",
+    cl::desc("Restrict CFL store protection to comma-separated function regexes"),
+    cl::ZeroOrMore, cl::CommaSeparated, cl::NotHidden);
+
+static cl::list<std::string>
+CallArgFunctions("cfl-protect-call-arg-funcs",
+    cl::desc("Protect pointer arguments at direct-call boundaries for matching callees"),
+    cl::ZeroOrMore, cl::CommaSeparated, cl::NotHidden);
 
 static cl::opt<bool>
 BranchProtect("cfl-protect-branches",
@@ -62,6 +78,10 @@ namespace {
     unsigned long totalIFCs          = 0;
     std::map<const BasicBlock *, int> syntheticBGIDs;
     std::map<const Instruction *, int> syntheticIBIDs;
+    std::vector<Regex*> FunctionRegexes;
+    std::vector<Regex*> loadFunctionRegexes;
+    std::vector<Regex*> storeFunctionRegexes;
+    std::vector<Regex*> callArgFunctionRegexes;
     int nextSyntheticBGID = -1;
     int nextSyntheticIBID = -1;
     
@@ -197,7 +217,137 @@ namespace {
             CB.setCalledFunction(NewCallee);
     }
 
+    bool isCflRuntimeHook(Function *Callee) {
+        StringRef Name = Callee->getName();
+        return Name == "cfl_br_cond" || Name == "cfl_br_get_fixed" ||
+               Name == "cfl_br_iftrue" || Name == "cfl_br_iffalse" ||
+               Name == "cfl_br_merge" || Name == "cfl_ptr_wrap" ||
+               Name == "cfl_fptr_wrap" || Name == "cfl_dummy_ext_func" ||
+               Name == "cfl_memcpy" || Name == "cfl_memmove" ||
+               Name == "cfl_memset" || Name == "cfl_loop_preheader" ||
+               Name == "cfl_loop_exiting" || Name == "cfl_loop_exit" ||
+               Name == "cfl_loop_dump_count";
+    }
+
+    bool isGeneratedControlFunction(Function *F) {
+        if (!F)
+            return false;
+        StringRef Name = F->getName();
+        return Name.starts_with("__cfl_") || Name.starts_with("branch_") ||
+               Name.starts_with("loop_");
+    }
+
+    std::optional<std::string> generatedControlParentName(Function *F) {
+        if (!isGeneratedControlFunction(F))
+            return std::nullopt;
+
+        StringRef Name = F->getName();
+        StringRef Parent;
+        if (Name.consume_front("__cfl_branch_"))
+            Parent = Name;
+        else if (Name.consume_front("__cfl_loop_"))
+            Parent = Name;
+        else if (Name.consume_front("branch_"))
+            Parent = Name;
+        else if (Name.consume_front("loop_"))
+            Parent = Name;
+        else
+            return std::nullopt;
+
+        size_t Suffix = Parent.find('.');
+        if (Suffix != StringRef::npos)
+            Parent = Parent.take_front(Suffix);
+        if (Parent.empty())
+            return std::nullopt;
+        return Parent.str();
+    }
+
+    bool matchesGeneratedControlParent(Function *F) {
+        std::optional<std::string> Parent = generatedControlParentName(F);
+        if (!Parent)
+            return false;
+        return passListRegexMatch(FunctionRegexes, *Parent);
+    }
+
+    const Value *stripPointerShape(const Value *V) {
+        const Value *Current = V;
+        SmallPtrSet<const Value *, 8> Seen;
+        while (Current && Seen.insert(Current).second) {
+            if (const auto *GEP = dyn_cast<GEPOperator>(Current)) {
+                Current = GEP->getPointerOperand();
+                continue;
+            }
+            if (const auto *Op = dyn_cast<Operator>(Current)) {
+                unsigned Opcode = Op->getOpcode();
+                if (Opcode == Instruction::BitCast ||
+                    Opcode == Instruction::AddrSpaceCast ||
+                    Opcode == Instruction::PtrToInt ||
+                    Opcode == Instruction::IntToPtr) {
+                    Current = Op->getOperand(0);
+                    continue;
+                }
+            }
+            break;
+        }
+        return Current;
+    }
+
+    bool isGeneratedStructuralSlot(const Value *Ptr) {
+        const Value *Root = stripPointerShape(Ptr);
+        if (!Root)
+            return false;
+        if (isa<AllocaInst>(Root))
+            return true;
+        if (const auto *Arg = dyn_cast<Argument>(Root)) {
+            StringRef Name = Arg->getName();
+            return Name.starts_with(".out");
+        }
+        return false;
+    }
+
+    bool isCflRuntimeStateGlobal(const Value *Ptr) {
+        const Value *Root = stripPointerShape(Ptr);
+        const auto *GV = dyn_cast_or_null<GlobalVariable>(Root);
+        if (!GV)
+            return false;
+        StringRef Name = GV->getName();
+        return Name == "taken";
+    }
+
+    bool isConstantGlobalLoad(const Value *Ptr) {
+        const Value *Root = stripPointerShape(Ptr);
+        const auto *GV = dyn_cast_or_null<GlobalVariable>(Root);
+        return GV && GV->isConstant();
+    }
+
+    bool shouldWrapGeneratedLoad(LoadInst *LI) {
+        Function *F = LI->getFunction();
+        if (!isGeneratedControlFunction(F))
+            return false;
+        const Value *Ptr = LI->getPointerOperand();
+        if (isGeneratedStructuralSlot(Ptr))
+            return false;
+        if (isCflRuntimeStateGlobal(Ptr))
+            return false;
+        if (isConstantGlobalLoad(Ptr))
+            return false;
+        return true;
+    }
+
+    bool shouldWrapLoad(LoadInst *LI, bool ProtectLoads) {
+        const Value *Ptr = LI->getPointerOperand();
+        if (isGeneratedStructuralSlot(Ptr))
+            return false;
+        if (isCflRuntimeStateGlobal(Ptr))
+            return false;
+        if (isConstantGlobalLoad(Ptr))
+            return false;
+        return ProtectLoads || shouldWrapGeneratedLoad(LI);
+    }
+
     void wrapExtCall(CallBase &CB, Function *Callee) {
+        if (isCflRuntimeHook(Callee))
+            return;
         Module *M = Callee->getParent();
         LLVMContext &Ctx = M->getContext();
         Type *PtrTy = PointerType::getUnqual(Ctx);
@@ -254,6 +404,65 @@ namespace {
         // do not inline now to avoid loops-cfl detecting this as an escaping value
         // due to the call to an unrecognized function
         // assert(InlineFunction(CS, IFI));
+    }
+
+    bool isCflPtrWrapResult(Value *V) {
+        const Value *Root = stripPointerShape(V);
+        const auto *CB = dyn_cast_or_null<CallBase>(Root);
+        if (!CB)
+            return false;
+        const Function *Callee = CB->getCalledFunction();
+        return Callee && Callee->getName() == "cfl_ptr_wrap";
+    }
+
+    bool shouldWrapCallArg(CallBase &CB, Function *Callee, unsigned ArgNo) {
+        if (ArgNo >= CB.arg_size() || ArgNo >= Callee->arg_size())
+            return false;
+        Value *Arg = CB.getArgOperand(ArgNo);
+        if (!Arg || !Arg->getType()->isPointerTy())
+            return false;
+        if (isa<ConstantPointerNull>(Arg) || isa<UndefValue>(Arg))
+            return false;
+        if (CB.paramHasAttr(ArgNo, Attribute::ReadOnly) ||
+            CB.paramHasAttr(ArgNo, Attribute::ReadNone))
+            return false;
+        const Argument *Formal = Callee->getArg(ArgNo);
+        if (Formal->hasAttribute(Attribute::ReadOnly) ||
+            Formal->hasAttribute(Attribute::ReadNone))
+            return false;
+        return !isCflPtrWrapResult(Arg);
+    }
+
+    void wrapCallArg(CallBase &CB, unsigned ArgNo) {
+        Module *M = CB.getParent()->getParent()->getParent();
+        LLVMContext &Ctx = M->getContext();
+        Type *PtrTy = PointerType::getUnqual(Ctx);
+        FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy}, false);
+        FunctionCallee Wrap = M->getOrInsertFunction("cfl_ptr_wrap", FTy);
+        Function *F = dyn_cast<Function>(Wrap.getCallee());
+        if (!F)
+            return;
+        Value *Arg = CB.getArgOperand(ArgNo);
+        std::vector<Value*> Args;
+        Args.push_back(CastInst::CreatePointerCast(
+            Arg, F->getFunctionType()->getParamType(0), "", &CB));
+        CallInst *CI = CallInst::Create(F, Args, "", &CB);
+        CB.setArgOperand(
+            ArgNo,
+            CastInst::CreatePointerCast(CI, Arg->getType(), "", &CB));
+    }
+
+    void wrapDirectCallBoundaryArgs(CallBase &CB, Function *Callee) {
+        if (!Callee || Callee->isDeclaration() || Callee->isIntrinsic())
+            return;
+        if (isCflRuntimeHook(Callee))
+            return;
+        if (!matchesCallArgProtectCallee(Callee))
+            return;
+        for (unsigned ArgNo = 0; ArgNo < CB.arg_size(); ++ArgNo) {
+            if (shouldWrapCallArg(CB, Callee, ArgNo))
+                wrapCallArg(CB, ArgNo);
+        }
     }
 
 
@@ -507,23 +716,69 @@ namespace {
         return &IFC;
     }
 
+    bool matchesControlFunction(Function *F) {
+        return passListRegexMatch(FunctionRegexes, F->getName().str());
+    }
+
+    bool matchesLoadProtectFunction(Function *F) {
+        const std::string FName = F->getName().str();
+        if (!MemProtect)
+            return false;
+        if (!loadFunctionRegexes.empty())
+            return passListRegexMatch(loadFunctionRegexes, FName);
+        return matchesControlFunction(F);
+    }
+
+    bool matchesStoreProtectFunction(Function *F) {
+        const std::string FName = F->getName().str();
+        if (!MemProtect)
+            return false;
+        if (matchesGeneratedControlParent(F))
+            return true;
+        if (!storeFunctionRegexes.empty())
+            return passListRegexMatch(storeFunctionRegexes, FName);
+        return matchesControlFunction(F);
+    }
+
+    bool matchesCallArgProtectCallee(Function *F) {
+        if (!F || !MemProtect || callArgFunctionRegexes.empty())
+            return false;
+        return passListRegexMatch(callArgFunctionRegexes, F->getName().str());
+    }
+
+    bool shouldVisitFunction(Function *F) {
+        return matchesControlFunction(F) || matchesLoadProtectFunction(F) ||
+               matchesStoreProtectFunction(F);
+    }
+
+    bool isProtectedRuntimeSection(Function *F) {
+        return F->getSection() == "dfl_code" || F->getSection() == "cfl_code" ||
+               F->getSection() == "cgc_code" || F->getSection() == "icp_code";
+    }
+
     void cfl(Function *F) {
         cflPassLog("CFLing " << F->getName());
         DominatorTree *DT = &getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
         PostDominatorTree PDT;
         PDT.recalculate(*F);
         F->addFnAttr("null-pointer-is-valid", "true");
+        bool ProtectBranches = BranchProtect && matchesControlFunction(F);
+        bool ProtectLoads = matchesLoadProtectFunction(F);
+        bool ProtectStores = matchesStoreProtectFunction(F);
+        bool ProtectCallArgs = matchesControlFunction(F) ||
+                               matchesGeneratedControlParent(F);
 
         // Wrap loads, stores, memory intrinsics, and external calls
         for (auto &BB : *F)
         for (auto &I : BB) {
             // If we run after DFL we must not wrap memory accesses since the only
             // mem accesses that have been left unprotected are the one DFL needs
-            if (MemProtect == true) {
-                if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+            if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                if (shouldWrapLoad(LI, ProtectLoads))
                     wrapLoad(LI);
-                    continue;
-                }
+                continue;
+            }
+            if (ProtectStores) {
                 if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
                     wrapStore(SI);
                     continue;
@@ -537,11 +792,15 @@ namespace {
                 continue; // not a direct call
             if (Callee->isIntrinsic())
                 wrapIntrinsicCall(*CB, Callee);
-            else if (Callee->isDeclaration())
+            else {
+              if (ProtectCallArgs)
+                wrapDirectCallBoundaryArgs(*CB, Callee);
+              if (Callee->isDeclaration())
                 wrapExtCall(*CB, Callee);
+            }
         }
 
-        if( BranchProtect == false) return;
+        if( ProtectBranches == false) return;
 
         // Loop over CFG to first find and then wrap conditions
         std::vector<IfCondition> ifConditions;
@@ -583,10 +842,12 @@ namespace {
     virtual bool runOnModule(Module &M) {
         cflPassLog("Running...");
 
-        std::vector<Regex*> FunctionRegexes;
         if (Functions.empty())
             Functions.push_back("main");
         passListRegexInit(FunctionRegexes, Functions);
+        passListRegexInit(loadFunctionRegexes, LoadFunctions);
+        passListRegexInit(storeFunctionRegexes, StoreFunctions);
+        passListRegexInit(callArgFunctionRegexes, CallArgFunctions);
 
         /* Iterate all functions in the module to cfl */
         std::set<Function*> cflFunctionSet;
@@ -594,11 +855,9 @@ namespace {
             if (F.isDeclaration())
                 continue;
             ++totalFuncs;
-            const std::string FName = F.getName().str();
-            if (!passListRegexMatch(FunctionRegexes, FName))
+            if (!shouldVisitFunction(&F))
                 continue;
-            if (F.getSection() == "dfl_code" || F.getSection() == "cfl_code" ||
-                F.getSection() == "cgc_code" || F.getSection() == "icp_code")
+            if (isProtectedRuntimeSection(&F))
                 continue;
             cflFunctionSet.insert(&F);
         }
